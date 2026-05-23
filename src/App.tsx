@@ -26,10 +26,18 @@ export default function App() {
   const [customContent, setCustomContent] = useState('');
   const [ytUrl, setYtUrl] = useState('');
   
+  // Slide Upload state
+  const [uploadedFileBase64, setUploadedFileBase64] = useState<string | null>(null);
+  const [uploadedFileMimeType, setUploadedFileMimeType] = useState<string | null>(null);
+  const [uploadedFileName, setUploadedFileName] = useState<string | null>(null);
+  
   // Microphone recording state
   const [isRecording, setIsRecording] = useState(false);
   const [recordSeconds, setRecordSeconds] = useState(0);
-  const recordInterval = useRef<NodeJS.Timeout | null>(null);
+  const recordInterval = useRef<any>(null);
+  const [isTranscribingAudio, setIsTranscribingAudio] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   
   // App notes database
   const [notesList, setNotesList] = useState<LectureNote[]>([]);
@@ -70,12 +78,47 @@ export default function App() {
   const [showHomeIntro, setShowHomeIntro] = useState(false);
   const [showCheckInModal, setShowCheckInModal] = useState(false);
   const [showBookmarkModal, setShowBookmarkModal] = useState(false);
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
 
   // File Upload states and reference mapping
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
 
-  // Daily Streak and Attendance Logs (Daily 10:00 AM refresh structure)
+  // Helper functions for Taiwan calendar days (synchronized to Asia/Taipei timezone)
+  const getTaiwanDateDetails = (offsetDays = 0) => {
+    const d = new Date();
+    if (offsetDays !== 0) {
+      d.setDate(d.getDate() - offsetDays);
+    }
+    const formatter = new Intl.DateTimeFormat('zh-TW', {
+      timeZone: 'Asia/Taipei',
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      weekday: 'short'
+    });
+    const parts = formatter.formatToParts(d);
+    const month = parts.find(p => p.type === 'month')?.value || '';
+    const day = parts.find(p => p.type === 'day')?.value || '';
+    const weekday = parts.find(p => p.type === 'weekday')?.value || '';
+    
+    const key = `${month}/${day}`;
+    return {
+      key,
+      display: `${month}/${day} (${weekday})`,
+      isToday: offsetDays === 0
+    };
+  };
+
+  const getTaiwan30Days = (): { key: string; display: string; isToday: boolean }[] => {
+    const list = [];
+    for (let i = 0; i < 30; i++) {
+      list.push(getTaiwanDateDetails(i));
+    }
+    return list;
+  };
+
+  // Daily Streak and Attendance Logs (Taiwan Time system, 30 days maximum)
   const [checkInLogs, setCheckInLogs] = useState<{[key: string]: boolean}>(() => {
     try {
       const savedLogs = localStorage.getItem('organizer_checkin_logs_v2');
@@ -85,15 +128,14 @@ export default function App() {
     } catch (e) {
       console.error(e);
     }
-    return {
-      '5/21': true,
-      '5/20': true,
-      '5/19': true,
-      '5/18': false,
-      '5/17': false,
-      '5/16': false,
-      '5/15': false,
-    };
+    
+    // Seed initial active state for first 3 days within Asia/Taipei timezone so it starts initialized beautifully
+    const initialLogs: {[key: string]: boolean} = {};
+    for (let i = 0; i < 30; i++) {
+      const d = getTaiwanDateDetails(i);
+      initialLogs[d.key] = i < 3;
+    }
+    return initialLogs;
   });
 
   // Automatically save logs on change
@@ -105,18 +147,30 @@ export default function App() {
     }
   }, [checkInLogs]);
 
-  // Helper to calculate consecutive check-in days backwards from today
+  // Helper to calculate consecutive check-in days backwards from today starting on Taiwan UTC+8
   const calculateStreak = (logs: {[key: string]: boolean}) => {
-    const datesSeq = ['5/21', '5/20', '5/19', '5/18', '5/17', '5/16', '5/15'];
-    let count = 0;
-    for (const d of datesSeq) {
-      if (logs[d]) {
-        count++;
+    let streakCount = 0;
+    const todayKey = getTaiwanDateDetails(0).key;
+    const yesterdayKey = getTaiwanDateDetails(1).key;
+    
+    let startIndex = 0;
+    if (logs[todayKey]) {
+      startIndex = 0;
+    } else if (logs[yesterdayKey]) {
+      startIndex = 1;
+    } else {
+      return 0; // Streak broken: neither today nor yesterday has been checked in
+    }
+    
+    for (let i = startIndex; i < 30; i++) {
+      const dateKey = getTaiwanDateDetails(i).key;
+      if (logs[dateKey]) {
+        streakCount++;
       } else {
         break;
       }
     }
-    return count;
+    return Math.min(streakCount, 30);
   };
 
   const streakDays = calculateStreak(checkInLogs);
@@ -295,9 +349,27 @@ export default function App() {
       const saved = localStorage.getItem('ai_lecture_notes');
       if (saved) {
         const parsed = JSON.parse(saved);
-        setNotesList(parsed);
-        if (parsed.length > 0) {
-          setActiveNoteId(parsed[0].id);
+        // Normalize loaded notes quiz questions to make sure correctAnswer (number indices) is always generated or filled accurately
+        const normalized = parsed.map((n: LectureNote) => ({
+          ...n,
+          quiz: n.quiz ? n.quiz.map(q => {
+            let corrVal = q.correctAnswer;
+            if (typeof corrVal !== 'number' && typeof q.answer === 'string') {
+              corrVal = q.answer.trim().toUpperCase().charCodeAt(0) - 65;
+            }
+            if (typeof corrVal !== 'number') {
+              corrVal = 0;
+            }
+            return {
+              ...q,
+              correctAnswer: corrVal,
+              answer: q.answer || String.fromCharCode(65 + corrVal)
+            };
+          }) : []
+        }));
+        setNotesList(normalized);
+        if (normalized.length > 0) {
+          setActiveNoteId(normalized[0].id);
         }
       } else {
         // Hydrate mock historical session if empty so user gets high fidelity feels immediately
@@ -311,7 +383,7 @@ export default function App() {
           summary: '這堂課說明了 JavaScript 的事件驅動模型 (Event-Driven Architecture) 的核心：Event Loop。單線程的 JS 得以不阻塞運作，完全仰賴將非同步回調發送至 Microtask 與 Macrotask 隊列，並依照特定優先順序載入調度，這是前端工程師最關鍵的進階基石。',
           keyPoints: [
             'JS 屬於單執行緒 (Single-threaded) 語言，具有一張 Call Stack。',
-            '事件循環專責在堆疊清空時，將隊列中等待執行的回調函數移回堆疊。',
+            '事件循環專責在堆疊清空時，將隊列中等待執行的回調函數移回堆疊.（LIFO 結構）',
             '微任務 (Microtasks) 優先級嚴格高於宏任務 (Macrotasks)。',
             '理解 Microtask 的清空順序，能解決大部分的複雜非同步競態問題 (Race Conditions)。'
           ],
@@ -346,6 +418,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
               question: '下列何者不屬於 Microtask (微任務)？',
               options: ['Promise.then() 回調', 'process.nextTick', 'setTimeout 回調', 'MutationObserver 回調'],
               answer: 'C',
+              correctAnswer: 2,
               explanation: 'setTimeout 會在 Web API 背景計時結束後排入 Macrotask Queue (宏任務隊列)，其他三者皆會排入 Microtask Queue，其優先處理級更高。'
             },
             {
@@ -353,6 +426,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
               question: '在事件循環中，當 Call Stack 被清空時，Event Loop 會優先清空哪個隊列？',
               options: ['Macrotask Queue', 'Microtask Queue', '兩者隨機挑選', '完全不再清空'],
               answer: 'B',
+              correctAnswer: 1,
               explanation: '每次 Call Stack 清空之後，Event Loop 絕對會先保證 Microtask Queue 是完全排空的，接著才讀取一個 Macrotask 執行。'
             }
           ]
@@ -386,32 +460,116 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
     }
   };
 
-  // Audio voice recording mockup
+  // Audio voice recording utilizing real MediaRecorder API
   const startRecording = async () => {
     try {
-      // Real microphone feedback permission step
-      await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      
+      // Determine best supported MIME type
+      let selectedMimeType = 'audio/webm';
+      if (typeof MediaRecorder !== 'undefined') {
+        if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
+          selectedMimeType = 'audio/ogg';
+        }
+        if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
+          selectedMimeType = 'audio/mp4';
+        }
+        if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
+          selectedMimeType = 'audio/wav';
+        }
+        if (!MediaRecorder.isTypeSupported(selectedMimeType)) {
+          selectedMimeType = ''; // Use browser default
+        }
+      }
+
+      const recorder = new MediaRecorder(stream, selectedMimeType ? { mimeType: selectedMimeType } : undefined);
+      mediaRecorderRef.current = recorder;
+      
+      recorder.ondataavailable = (event) => {
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        // Stop all tracks on the stream to release the mic
+        stream.getTracks().forEach(track => track.stop());
+
+        if (audioChunksRef.current.length === 0) {
+          return;
+        }
+
+        const audioBlob = new Blob(audioChunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        
+        setIsTranscribingAudio(true);
+        setErrorMessage(null);
+
+        try {
+          // Convert audio blob to base64
+          const reader = new FileReader();
+          reader.readAsDataURL(audioBlob);
+          reader.onloadend = async () => {
+            const base64Url = reader.result as string;
+            const base64Data = base64Url.split(',')[1];
+
+            // Send to our real backend speech-to-text API
+            const response = await fetch('/api/transcribe-audio', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                audioBase64: base64Data,
+                mimeType: recorder.mimeType || 'audio/webm'
+              })
+            });
+
+            if (!response.ok) {
+              const errData = await response.json();
+              throw new Error(errData.error || '語音轉文字請求失敗。');
+            }
+
+            const data = await response.json();
+            if (data.transcript) {
+              setCustomContent(data.transcript);
+            }
+            setIsTranscribingAudio(false);
+          };
+        } catch (error: any) {
+          console.error('Transcription error:', error);
+          setErrorMessage(`語音轉換失敗：${error.message || '請手動輸入重點段落內容。'}`);
+          setIsTranscribingAudio(false);
+        }
+      };
+
+      recorder.start(250); // Slice audio in 250ms chunks to keep it safe
+
       setIsRecording(true);
       setRecordSeconds(0);
-      setLectureTitle(`課堂錄音筆記 - ${new Date().toLocaleDateString()}`);
+      setLectureTitle(`課堂錄音筆記 - ${new Date().toLocaleDateString('zh-TW')}`);
       
+      if (recordInterval.current) clearInterval(recordInterval.current);
       recordInterval.current = setInterval(() => {
         setRecordSeconds(prev => prev + 1);
       }, 1000);
 
-      // Create beautiful moving waveform animation using random values
+      if (visualInterval.current) clearInterval(visualInterval.current);
       visualInterval.current = setInterval(() => {
         setVisualizerBars(Array(15).fill(0).map(() => Math.floor(Math.random() * 45) + 8));
       }, 150);
-    } catch (err) {
+
+    } catch (err: any) {
       console.error('Mic permission denied or unsupported:', err);
-      // Fallback simulating recording inside sandbox safely
+      setErrorMessage('無法取得麥克風權限或瀏覽器不支援錄音。請確認已開啟權限，或直接貼上講義。');
+      
+      // Fallback mockup simulated fallback so it continues to work in headless preview contexts
       setIsRecording(true);
       setRecordSeconds(0);
-      setLectureTitle(`課堂錄音筆記 - ${new Date().toLocaleDateString()}`);
+      setLectureTitle(`課堂錄音筆記 (演示範本) - ${new Date().toLocaleDateString('zh-TW')}`);
+      if (recordInterval.current) clearInterval(recordInterval.current);
       recordInterval.current = setInterval(() => {
         setRecordSeconds(prev => prev + 1);
       }, 1000);
+      if (visualInterval.current) clearInterval(visualInterval.current);
       visualInterval.current = setInterval(() => {
         setVisualizerBars(Array(15).fill(0).map(() => Math.floor(Math.random() * 45) + 8));
       }, 150);
@@ -422,12 +580,16 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
     setIsRecording(false);
     if (recordInterval.current) clearInterval(recordInterval.current);
     if (visualInterval.current) clearInterval(visualInterval.current);
-    
-    // Simulate speech-to-text output based on timer size or preset fallback
-    if (customContent.trim() === '') {
-      setCustomContent(
-        `[語音識別已自動在手機端完成，時長 ${recordSeconds} 秒]\n這是一份語音輸入筆記。課堂中所討論的核心主題包括學分安排、教學重點以及考前複習重點。在準備上學期期末考時，教授建議同學務必複習第二章、第四章與第五章，尤其是與系統整合及演算法設計有關的實作題，會佔期末總分的四成。此外，請同學特別留意團隊作業的截止時間為下週五中午十二分，逾期不候。`
-      );
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    } else {
+      // Mockup simulated fallback if mediaRecorder didn't capture or in sandbox fallback
+      if (customContent.trim() === '') {
+        setCustomContent(
+          `[系統演示] 這是一份模擬的語音錄音逐字稿。語音轉換文字模組已完成高精度比對：本課主講電腦科學的極限運算、時間複雜度，與空間複雜度分析，我們需要特別理解 Big-O 符號的使用，尤其是 O(1) 與 O(log n) 的二分搜尋演算法效能。`
+        );
+      }
     }
   };
 
@@ -463,40 +625,59 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
   const handlePickedFile = (file: File) => {
     if (!file) return;
     setLectureTitle(file.name.replace(/\.[^/.]+$/, "")); // Auto populate lecture title
+    setUploadedFileName(file.name);
     
     const extension = file.name.split('.').pop()?.toLowerCase();
+    const reader = new FileReader();
+
     if (extension === 'txt' || extension === 'md' || extension === 'json' || extension === 'csv') {
-      const reader = new FileReader();
       reader.onload = (event) => {
         if (event.target?.result && typeof event.target.result === 'string') {
           setCustomContent(event.target.result);
+          try {
+            const base64Str = btoa(unescape(encodeURIComponent(event.target.result)));
+            setUploadedFileBase64(base64Str);
+            setUploadedFileMimeType('text/plain');
+          } catch (e) {
+            console.error('Text base64 conversion failed:', e);
+          }
         }
       };
       reader.readAsText(file);
     } else {
       // PDF, PPT, images, doc...
-      const fileSizeKBs = Math.round(file.size / 1024);
-      const outputText = [
-        `=== 📥 已成功載入外部簡報講義檔案 ===`,
-        `檔案名稱：${file.name}`,
-        `檔案容量：${fileSizeKBs} KB`,
-        `檔案類型：${file.type || '未知應用類型'}`,
-        `系統判定：簡報幻燈片結構與內文`,
-        ``,
-        `=== 📋 經處理後提取出的簡報 Slide 投影片核心大綱與文字段落 ===`,
-        `[Slide 1: 課程簡介]`,
-        `- 主體名稱：${file.name.replace(/\.[^/.]+$/, "")}`,
-        `- 本課堂核心知識點對接，涵蓋近年的重大技術突破、基礎定義與應用。`,
-        ``,
-        `[Slide 2: 優化分析與重要理論公式]`,
-        `- 設計關鍵指標：系統承載量、高負載動態調配率與資料頻寬最佳化。`,
-        `- 重要核心公式與實踐，提供高可靠性的運作，全面增加回應存留速度。`,
-        ``,
-        `[Slide 3: 複習要點與作業規範]`,
-        `- 授課重點：同學應著重深度複習第四章與第七章。課後作業預計於下週五截止。`,
-        `- 期末考考題將涵蓋這些核心大綱，請同協務必精析重點。`
-      ].join('\n');
-      setCustomContent(outputText);
+      reader.onloadend = () => {
+        const base64Url = reader.result as string;
+        if (base64Url && base64Url.includes(',')) {
+          const base64Data = base64Url.split(',')[1];
+          setUploadedFileBase64(base64Data);
+          
+          let fileType = file.type || 'application/octet-stream';
+          if (!file.type) {
+            if (extension === 'pdf') fileType = 'application/pdf';
+            else if (extension === 'jpg' || extension === 'jpeg') fileType = 'image/jpeg';
+            else if (extension === 'png') fileType = 'image/png';
+            else if (extension === 'webp') fileType = 'image/webp';
+          }
+          setUploadedFileMimeType(fileType);
+          
+          const fileSizeKBs = Math.round(file.size / 1024);
+          const outputText = [
+            `=== 📥 已成功載入真實講義檔案 ===`,
+            `檔案名稱：${file.name}`,
+            `檔案大小：${fileSizeKBs} KB`,
+            `檔案類型：${fileType}`,
+            ``,
+            `✨ [真實內容讀取模式已啟動] ✨`,
+            `本系統已完成講義檔案的無損波型/結構預載。`,
+            `當您點擊下方的「開始生成筆記與複習題」時，`,
+            `後端 AI 引擎 (Gemini Multimodal Brain) 將 100% 直讀此檔案的真實內容及文字，不再使用隨機模擬生成。`,
+            `如果您上傳的是 PDF 講義或精美簡報圖片，AI 將全面辨識圖表與公式，提煉考點！`
+          ].join('\n');
+          setCustomContent(outputText);
+        }
+      };
+      reader.readAsDataURL(file);
     }
   };
 
@@ -516,7 +697,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
         contentToSubmit = `請分析此 YouTube 線上影片連結：${ytUrl}。探討課程核心邏輯、大綱摘要，並產生相應的考題與重點。`;
       }
     } else if (sourceType === 'ppt') {
-      finalSourceVal = 'PPT投影片檔.pdf';
+      finalSourceVal = uploadedFileName || 'PPT投影片檔.pdf';
       if (!contentToSubmit.trim()) {
         setErrorMessage('請上傳您的投影片文字大綱或直接在此貼入投影片說明。');
         return;
@@ -541,6 +722,9 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
           sourceType,
           title: titleToUse,
           content: contentToSubmit,
+          ytUrl: sourceType === 'youtube' ? ytUrl : undefined,
+          fileBase64: sourceType === 'ppt' ? uploadedFileBase64 : undefined,
+          fileMimeType: sourceType === 'ppt' ? uploadedFileMimeType : undefined,
         }),
       });
 
@@ -551,6 +735,22 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
 
       const generatedData = await response.json();
 
+      const rawQuiz = generatedData.quiz || [];
+      const normalizedQuiz = rawQuiz.map((q: any) => {
+        let corrVal = q.correctAnswer;
+        if (typeof corrVal !== 'number' && typeof q.answer === 'string') {
+          corrVal = q.answer.trim().toUpperCase().charCodeAt(0) - 65;
+        }
+        if (typeof corrVal !== 'number') {
+          corrVal = 0;
+        }
+        return {
+          ...q,
+          correctAnswer: corrVal,
+          answer: q.answer || String.fromCharCode(65 + corrVal)
+        };
+      });
+
       const newNote: LectureNote = {
         id: 'note-' + Date.now(),
         title: titleToUse,
@@ -560,7 +760,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
         transcript: generatedData.transcript || '',
         summary: generatedData.full_digest || generatedData.summary || '',
         keyPoints: generatedData.summary_one_minute || generatedData.keyPoints || [],
-        quiz: generatedData.quiz || [],
+        quiz: normalizedQuiz,
         
         // Save modern rich structures
         summary_one_minute: generatedData.summary_one_minute,
@@ -573,9 +773,10 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
       setActiveNoteId(newNote.id);
       
       // Update streak and push to summary tab
+      const todayKey = getTaiwanDateDetails(0).key;
       setCheckInLogs(prev => ({
         ...prev,
-        '5/21': true
+        [todayKey]: true
       }));
       setActiveTab('notes');
 
@@ -583,6 +784,9 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
       setLectureTitle('');
       setCustomContent('');
       setYtUrl('');
+      setUploadedFileBase64(null);
+      setUploadedFileMimeType(null);
+      setUploadedFileName(null);
 
     } catch (err: any) {
       console.error(err);
@@ -682,7 +886,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
 - **前端工具架構**: React 18+, Vite, Tailwind CSS 4+
 - **資料持久化機制**: 使用 ${coachBackend} 來存儲歷史筆記與測驗得分績效。
 - **UI風調與質感要求**:
-  - 精緻的 Notion 極簡風格（米白、白、深柔調炭灰），配以乾淨對比度與流暢動畫。
+  - 精緻的極簡美學風格（米白、白、深柔調炭灰），配以乾淨對比度與流暢動畫。
   - 充分利用卡片式與欄位結構。
     `.trim();
   };
@@ -800,7 +1004,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
   return (
     <div className="min-h-screen bg-[#FFFFFF] font-sans text-[#37352F] flex antialiased selection:bg-[#E3E2E0]/40 selection:text-[#37352F] h-screen overflow-hidden">
       
-      {/* 1. Left Sidebar - Notion Space (Desktop only) */}
+      {/* 1. Left Sidebar - Workspace (Desktop only) */}
       <aside className="hidden md:flex flex-col w-60 shrink-0 bg-[#F7F7F5] border-r border-[#E9E9E6] select-none text-[13px] h-full overflow-y-auto">
         {/* Workspace identifier block */}
         <div className="px-4 py-3.5 border-b border-[#E9E9E6]/60 flex items-center justify-between hover:bg-[#F1F1EF] transition-colors cursor-pointer">
@@ -963,9 +1167,23 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
               <Flame className="w-3.5 h-3.5 fill-current animate-pulse" />
               <span>{streakDays} 天學習</span>
             </div>
-            {/* Quick Share mock */}
-            <button className="p-1.5 hover:bg-[#F1F1EF] rounded text-[#7C7B77] cursor-pointer" title="分享與連線狀態">
-              <span className="text-[12px] font-medium px-1">Share</span>
+            {/* Quick Share button - Copies direct Vercel link */}
+            <button 
+              onClick={() => {
+                navigator.clipboard.writeText('https://vibe-coding-silk-eight.vercel.app/');
+                setCopiedShareLink(true);
+                setTimeout(() => setCopiedShareLink(false), 2000);
+              }}
+              className={`p-1.5 rounded cursor-pointer transition-all flex items-center gap-1 border ${
+                copiedShareLink 
+                  ? 'text-emerald-700 bg-emerald-50 border-emerald-200 px-2' 
+                  : 'text-[#7C7B77] hover:bg-[#F1F1EF] border-transparent'
+              }`}
+              title="分享與連線狀態"
+            >
+              <span className="text-[12px] font-bold px-1">
+                {copiedShareLink ? '✅ 已複製 Vibe-Coding 連結' : '🔗 複製分享連結'}
+              </span>
             </button>
             <button 
               onClick={() => setShowBookmarkModal(true)}
@@ -999,7 +1217,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
           </p>
         </div>
 
-        {/* Navigation Tabs (Simulated Notion Database View Selector) */}
+        {/* Navigation Tabs (Simulated Database View Selector) */}
         <div className="max-w-3xl w-full mx-auto px-6 md:px-12 mt-4 shrink-0">
           <div className="flex flex-wrap gap-1 border-b border-[#E9E9E6] text-[13px] text-[#7C7B77]">
             <button
@@ -1176,7 +1394,22 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
 
                     {/* Source 1: Voice recording */}
                     {sourceType === 'voice' && (
-                      <div className="flex flex-col gap-4">
+                      <div className="flex flex-col gap-4 relative">
+                        {isTranscribingAudio && (
+                          <div className="absolute inset-0 bg-white/95 rounded-md flex flex-col items-center justify-center gap-2.5 z-20 border border-amber-300 p-6 shadow-sm">
+                            <span className="text-[11px] font-bold text-amber-600 animate-pulse flex items-center gap-1.5 font-mono">
+                              <span className="relative flex h-2.5 w-2.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-amber-500"></span>
+                              </span>
+                              極精密語音轉文字進行中 (Speech-to-Text)
+                            </span>
+                            <p className="text-[11px] text-[#5A5A57] font-semibold text-center leading-relaxed max-w-[340px]">
+                              本系統正在將麥克風錄製的真實音訊訊號編碼成無損波型，傳送至後端 <span className="text-amber-700 bg-amber-50 font-mono px-1 rounded">Gemini Multimodal Brain</span> 進行 100% 真實逐字稿智慧轉譯，請稍候...
+                            </p>
+                            <div className="w-5 h-5 rounded-full border-2 border-amber-500 border-t-transparent animate-spin mt-2"></div>
+                          </div>
+                        )}
                         <div className="p-4 bg-[#F7F7F5] border border-[#E9E9E6] border-dashed rounded-md flex flex-col items-center justify-center py-6">
                           {isRecording ? (
                             <div className="flex flex-col items-center gap-2.5">
@@ -1248,6 +1481,40 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                           className="hidden" 
                           accept=".ppt,.pptx,.pdf,.txt,.md,.csv,.doc,.docx"
                         />
+                        
+                        {uploadedFileName && (
+                          <div className="p-3.5 bg-amber-50/65 border border-amber-200/80 rounded-md flex items-center justify-between text-xs text-[#37352F] shadow-xs">
+                            <div className="flex items-center gap-2.5">
+                              <div className="w-8 h-8 rounded bg-amber-500/10 flex items-center justify-center shrink-0 border border-amber-500/20">
+                                <FileText className="w-4 h-4 text-amber-700" />
+                              </div>
+                              <div className="flex flex-col">
+                                <span className="font-bold text-[11px] text-[#23221E] truncate max-w-[200px] sm:max-w-[300px]">
+                                  {uploadedFileName}
+                                </span>
+                                <span className="text-[10px] text-amber-800 font-semibold flex items-center gap-1">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                                  真實內容讀取模式已就緒，AI 將精準辨識與解析
+                                </span>
+                              </div>
+                            </div>
+                            <button 
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setUploadedFileBase64(null);
+                                setUploadedFileMimeType(null);
+                                setUploadedFileName(null);
+                                setCustomContent('');
+                              }}
+                              className="text-gray-400 hover:text-red-500 font-bold p-1 bg-white hover:bg-red-50 rounded border border-gray-200 cursor-pointer transition-colors"
+                              title="移除已選檔案"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        )}
+
                         <div 
                           onClick={() => fileInputRef.current?.click()}
                           onDragOver={handleDragOver}
@@ -1330,7 +1597,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                       {isProcessing ? (
                         <>
                           <RefreshCw className="w-4 h-4 animate-spin" />
-                          <span>Notion AI 正在呼叫後端智慧編撰中 (3~5秒)...</span>
+                          <span>AI 正在呼叫後端智慧編撰中 (3~5秒)...</span>
                         </>
                       ) : (
                         <>
@@ -2410,7 +2677,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
               {/* Body */}
               <div className="p-6 overflow-y-auto flex flex-col gap-4 text-xs font-medium text-[#5A5A57] leading-relaxed text-left">
                 <p>
-                  歡迎來到 <b>AI 課堂筆記整理器</b>！本系統集成了尖端的自然語言處理技術，旨在為廣大學員、導師與自主學習者，提供超一流、免去碎片化筆記煩惱的 Notion 級一站式數位學習新空間。
+                  歡迎來到 <b>AI 課堂筆記整理器</b>！本系統集成了尖端的自然語言處理技術，旨在為廣大學員、導師與自主學習者，提供超一流、免去碎片化筆記煩惱的一站式頂級數位學習新空間。
                 </p>
 
                 <h4 className="font-bold text-[#37352F] text-xs flex items-center gap-1.5 border-b border-[#F1F1EF] pb-1 mt-1">
@@ -2494,58 +2761,66 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
               {/* Body */}
               <div className="p-5 flex flex-col gap-4 text-xs font-medium text-[#5A5A57] leading-relaxed overflow-y-auto text-left">
                 <div className="bg-amber-50 rounded border border-amber-150 p-3 flex flex-col gap-1 text-amber-950 text-left">
-                  <span className="font-bold flex items-center gap-1 text-[11px]">📢 智慧回顧打卡機制</span>
+                  <span className="font-bold flex items-center gap-1 text-[11px]">📢 台灣時間對時打卡機制</span>
                   <p className="text-[10.5px]">
-                    打卡進度在每日<b>上午 10:00</b> 進行系統性的快取刷新判定。
-                    您可以在下方<b>直接點擊選取每一天</b>來自由點名補打卡，系統將自動計算最長連續天數！
+                    本系統與您的<b>台灣時間 (Asia/Taipei)</b> 完美保持對接。
+                    您可以在下方<b>自由點選或對 30 天內的日期進行捕簽</b>，系統將精準計算最大連續 30 天的學習火苗喔！
                   </p>
                 </div>
 
+                {streakDays >= 30 && (
+                  <div className="bg-amber-100/70 border border-amber-300 text-amber-950 rounded-lg p-3 text-[11px] flex flex-col gap-1 text-left">
+                    <span className="font-bold flex items-center gap-1 text-amber-900">👑 簽到日期已達最大限制 (30天)</span>
+                    <p className="leading-snug text-[10.5px] text-amber-900/90">
+                      恭喜！您的學習打卡天數已達<b>最大核心限制 (30 天)</b>。您仍可以在下方正常點擊打卡以維持火苗狀態，但紀錄天數將鎖定在 30 天滿載上限。
+                    </p>
+                  </div>
+                )}
+
                 <div className="flex flex-col gap-2 text-left">
-                  <span className="text-[10px] uppercase font-bold text-[#7C7B77] tracking-wider block">七日學習打卡列表（點選日期即可完成打卡）</span>
+                  <span className="text-[10px] uppercase font-bold text-[#7C7B77] tracking-wider block">30日學習打卡列表（點選日期即可完成打卡）</span>
                   
-                  <div className="grid grid-cols-1 gap-2">
-                    {['5/21', '5/20', '5/19', '5/18', '5/17', '5/16', '5/15'].map((date) => {
-                      const isToday = date === '5/21';
-                      const isChecked = !!checkInLogs[date];
+                  <div className="grid grid-cols-1 gap-1.5 max-h-[260px] overflow-y-auto pr-1">
+                    {getTaiwan30Days().map(({ key, display, isToday }) => {
+                      const isChecked = !!checkInLogs[key];
                       
                       return (
                         <div 
-                          key={date}
+                          key={key}
                           onClick={() => {
                             setCheckInLogs(prev => ({
                               ...prev,
-                              [date]: !prev[date]
+                              [key]: !prev[key]
                             }));
                           }}
-                          className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer select-none transition-all active:scale-99 ${
+                          className={`flex items-center justify-between p-2.5 rounded-lg border cursor-pointer select-none transition-all active:scale-99 ${
                             isChecked 
                               ? 'bg-amber-50/50 border-amber-300 text-[#37352F]' 
                               : 'bg-white border-[#E9E9E6] hover:bg-[#F7F7F5] text-[#7C7B77]'
                           }`}
                         >
                           <div className="flex items-center gap-2.5">
-                            <span className="text-sm">{isChecked ? '🔥' : '⏳'}</span>
+                            <span className="text-sm text-center w-5">{isChecked ? '🔥' : '⏳'}</span>
                             <div className="flex flex-col">
-                              <span className="font-bold text-[11.5px] text-[#37352F] flex items-center gap-1.5">
-                                {date} 課程打卡
+                              <span className="font-bold text-[11px] text-[#37352F] flex items-center gap-1.5">
+                                {display} 課程打卡
                                 {isToday && <span className="bg-amber-100 text-[#D97706] text-[8px] px-1.5 py-0.2 rounded border border-amber-200">今天</span>}
                               </span>
-                              <span className="text-[10px] text-[#7C7B77] mt-0.5">上午 10:00 刷新日點名</span>
+                              <span className="text-[9.5px] text-[#7C7B77]">台灣標準時間對接</span>
                             </div>
                           </div>
                           
                           <div className="flex items-center gap-1.5 font-bold shrink-0">
-                            <span className={`text-[10.5px] px-2 py-0.5 rounded-full ${
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full ${
                               isChecked ? 'bg-amber-50 text-amber-700 font-bold' : 'bg-slate-100 text-slate-500'
                             }`}>
                               {isChecked ? '已完成' : '未打卡'}
                             </span>
-                            <div className={`w-4.5 h-4.5 rounded-md border flex items-center justify-center transition-all ${
+                            <div className={`w-4 h-4 rounded border flex items-center justify-center transition-all ${
                               isChecked ? 'border-amber-500 bg-amber-500 text-white' : 'border-[#C1C1BE] bg-white'
                             }`}>
                               {isChecked && (
-                                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <svg className="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
                                 </svg>
                               )}
@@ -2559,7 +2834,10 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
 
                 <div className="flex justify-between items-center bg-[#F7F7F5] p-3 rounded-lg border border-[#E9E9E6] font-mono">
                   <span className="text-xs text-[#37352F] font-bold">當前連續打卡天數 :</span>
-                  <span className="text-sm font-bold text-[#D97706] bg-amber-100/50 px-2.5 py-0.5 rounded border border-amber-200">{streakDays} 天</span>
+                  <div className="flex items-center gap-1.5">
+                    {streakDays >= 30 && <span className="text-[9.5px] px-2 py-0.5 bg-amber-500/20 text-amber-800 rounded-full font-sans font-bold">已達最大上限</span>}
+                    <span className="text-sm font-bold text-[#D97706] bg-amber-100/50 px-2.5 py-0.5 rounded border border-amber-200">{streakDays} 天</span>
+                  </div>
                 </div>
               </div>
 
@@ -2568,20 +2846,16 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                 <button
                   type="button"
                   onClick={() => {
-                    // Quick fill helper
-                    setCheckInLogs({
-                      '5/21': true,
-                      '5/20': true,
-                      '5/19': true,
-                      '5/18': true,
-                      '5/17': true,
-                      '5/16': true,
-                      '5/15': true,
+                    const all30 = getTaiwan30Days();
+                    const newLogs = { ...checkInLogs };
+                    all30.forEach(d => {
+                      newLogs[d.key] = true;
                     });
+                    setCheckInLogs(newLogs);
                   }}
                   className="hover:bg-[#E9E9E6] text-[#7C7B77] hover:text-[#37352F] text-xs font-bold px-3 py-2 rounded cursor-pointer transition-colors"
                 >
-                  ⚡ 一鍵全補簽
+                  ⚡ 一鍵全補簽 30 天
                 </button>
                 <button
                   type="button"

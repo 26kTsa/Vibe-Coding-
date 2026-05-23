@@ -3,14 +3,16 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
+import { YoutubeTranscript } from 'youtube-transcript';
+import officeParser from 'officeparser';
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-// Enable JSON bodies (limit sizes for file uploads)
-app.use(express.json({ limit: '10mb' }));
+// Enable JSON bodies with higher limits for audio uploads
+app.use(express.json({ limit: '30mb' }));
 
 // Lazy initializer for Gemini client to prevent crashing on missing env keys during startup
 let aiClient: GoogleGenAI | null = null;
@@ -31,16 +33,173 @@ function getGeminiClient() {
   return aiClient;
 }
 
+// Robust retry wrapper to handle rate limits and 429 quota exhaustion gracefully
+async function executeGeminiWithRetry(
+  ai: GoogleGenAI,
+  params: {
+    model: string;
+    contents: any;
+    config?: any;
+  },
+  maxRetries = 3,
+  initialDelayMs = 1500
+): Promise<any> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      attempt++;
+      const errMsg = err.message || String(err);
+      const isRateLimit = errMsg.includes('429') || 
+                           errMsg.includes('RESOURCE_EXHAUSTED') || 
+                           errMsg.includes('quota') ||
+                           errMsg.includes('Resource has been exhausted') ||
+                           err.status === 429;
+      
+      if (isRateLimit && attempt <= maxRetries) {
+        // Calculate delay with exponential backoff and jitter
+        const delay = initialDelayMs * Math.pow(2, attempt - 1) + Math.random() * 500;
+        console.warn(`[Gemini-Retry] Received 429 Rate Limit (Attempt ${attempt}/${maxRetries}). Retrying in ${Math.round(delay)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+// Helper to extract YouTube video ID from multiple URL formats
+function getYoutubeId(url: string): string | null {
+  if (!url) return null;
+  const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=|shorts\/)([^#\&\?]*).*/;
+  const match = url.match(regExp);
+  return (match && match[2].length === 11) ? match[2] : null;
+}
+
+// REAL Speech-to-Text (Audio speech transcription via Gemini audio multimodal model)
+app.post('/api/transcribe-audio', async (req, res) => {
+  try {
+    const { audioBase64, mimeType } = req.body;
+    if (!audioBase64) {
+      return res.status(400).json({ error: 'Missing audioBase64 parameter.' });
+    }
+
+    const ai = getGeminiClient();
+
+    // Clean up mimeType (remove standard codecs arguments like "audio/webm;codecs=opus" -> "audio/webm")
+    const cleanMimeType = mimeType ? mimeType.split(';')[0] : 'audio/webm';
+    console.log(`[STT] Processing real voice recording transcription. Mime: ${cleanMimeType}, Base64 Length: ${audioBase64.length}`);
+
+    // Call high-fidelity transcription using Gemini 3.5 Flash with Retry
+    const response = await executeGeminiWithRetry(ai, {
+      model: 'gemini-3.5-flash',
+      contents: [
+        {
+          inlineData: {
+            data: audioBase64,
+            mimeType: cleanMimeType
+          }
+        },
+        '你是一個高精度的課堂錄音語音識別器。請將這段語音錄音精準、逐字翻譯/轉錄為繁體中文（台灣，zh-TW）。請只輸出最真實、逐字、不加任何修飾或額外標題的原文逐字稿內容，不要包含註解，不要任何引言、不用任何包裝文字。如果是安靜的沒有說話，請回傳「無語音內容」'
+      ]
+    });
+
+    const transcript = response.text?.trim() || '無法辨識語音內容。';
+    res.json({ transcript });
+
+  } catch (error: any) {
+    console.error('[STT] Speech-to-Text error:', error);
+    res.status(500).json({ 
+      error: error.message || '錄音轉換文字時發生錯誤。' 
+    });
+  }
+});
+
 // REST Api endpoints
 app.post('/api/generate', async (req, res) => {
   try {
-    const { sourceType, title, content } = req.body;
+    const { sourceType, title, content, ytUrl, fileBase64, fileMimeType } = req.body;
     
     if (!sourceType || !title || !content) {
       return res.status(400).json({ error: 'Missing parameters: sourceType, title, and content are required.' });
     }
 
     const ai = getGeminiClient();
+
+    // Fetch REAL YouTube Captions/Transcript if sourceType is youtube
+    let realYtTranscript = '';
+    if (sourceType === 'youtube') {
+      const urlToUse = ytUrl || content.trim();
+      const ytId = getYoutubeId(urlToUse);
+      if (ytId) {
+        try {
+          console.log(`[Video-to-Text] Attempting to fetch real YouTube captions for ID: ${ytId}`);
+          const parts = await YoutubeTranscript.fetchTranscript(ytId);
+          realYtTranscript = parts.map(p => p.text).join(' ');
+          console.log(`[Video-to-Text] Real captions fetched. Character count: ${realYtTranscript.length}`);
+        } catch (err: any) {
+          console.warn(`[Video-to-Text] Could not fetch native YouTube subtitles/captions for video ${ytId}:`, err.message || err);
+          // Don't throw - can still proceed with direct search grounding or user notes
+        }
+      }
+    }
+
+    // Process PPT / Document upload (officeparser if unsupported, or native multimodal if PDF/image)
+    let extractedOfficeText = '';
+    let nativeMultimodalPayload: any = null;
+
+    if (sourceType === 'ppt' && fileBase64 && fileMimeType) {
+      try {
+        const fileBuffer = Buffer.from(fileBase64, 'base64');
+        const lowerMime = fileMimeType.toLowerCase();
+        
+        // Native supported multimodal types by Gemini 3.5 Flash:
+        const isNativeMultimodal = lowerMime === 'application/pdf' || lowerMime.startsWith('image/');
+
+        if (isNativeMultimodal) {
+          console.log(`[Gemini-Multimodal] Mounting native Gemini media asset. Mime: ${lowerMime}`);
+          nativeMultimodalPayload = {
+            inlineData: {
+              data: fileBase64,
+              mimeType: lowerMime
+            }
+          };
+        } else {
+          // Check if this is a text file or text-like format that we can easily decode
+          const isTextFile = lowerMime.startsWith('text/') || 
+                             lowerMime === 'application/json' || 
+                             lowerMime === 'application/javascript' ||
+                             lowerMime === 'application/xml';
+          
+          if (isTextFile) {
+            console.log(`[File-Parser] Reading plain text file content directly.`);
+            extractedOfficeText = fileBuffer.toString('utf-8');
+          } else {
+            // Treat it as an Office Document (.pptx, .docx, .xlsx, .odt, etc.)
+            console.log(`[File-Parser] Attempting to parse Office document (${lowerMime}) via officeparser.`);
+            
+            const parsed = await new Promise<any>((resolve, reject) => {
+              officeParser.parseOffice(fileBuffer, (data, err) => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve(data);
+                }
+              });
+            });
+
+            if (parsed && typeof parsed === 'string') {
+              extractedOfficeText = parsed.trim();
+              console.log(`[File-Parser] Successfully extracted ${extractedOfficeText.length} characters from Office document.`);
+            }
+          }
+        }
+      } catch (err: any) {
+        console.error(`[File-Parser] Error parsing file with MIME ${fileMimeType}:`, err.message || err);
+        // Do not crash - back up to the user-entered text content
+      }
+    }
 
     let systemInstruction = `
       你是一個專為學生設計的「AI 課堂筆記整理器」的核心 AI 引擎（Backend Brain）。
@@ -53,82 +212,196 @@ app.post('/api/generate', async (req, res) => {
 
     let userPrompt = `
       這是一份課堂資料。主題為 "${title}"，資料來源形式為 "${sourceType}"。
-      
+    `;
+
+    if (sourceType === 'youtube') {
+      if (realYtTranscript) {
+        userPrompt += `
+        以下是從這個 YouTube 影片中「讀取到的真實說話字幕/逐字稿（Video-to-Text 原文）」：
+        ---
+        ${realYtTranscript}
+        ---
+        
+        請依據上述「真實轉換的講話逐字稿」進行高度學術和精華提煉，生成筆記與隨堂測驗。
+        另外，使用者也有提供以下的提示、重點說明或操作主題：
+        ---
+        ${content}
+        ---
+        `;
+      } else {
+        userPrompt += `
+        【特別指示】這是一個 YouTube 影片連結（${ytUrl || content}）。
+        由於此影片目前無法直接抽取原生字幕，請您使用「Google 關鍵字搜尋 Grounding 工具」，
+        搜尋該 YouTube 網址、影片標題或主題，獲取該影片的網頁大綱、描述、評論以及相關課程主題核心知識。
+        並以此「真實搜尋結果」為底蘊與核心事實，來為使用者精細編撰與提煉本堂課的筆記與複習題！
+        
+        使用者有提供以下的提示與操作主題：
+        ---
+        ${content}
+        ---
+        `;
+      }
+    } else if (sourceType === 'ppt') {
+      if (extractedOfficeText) {
+        userPrompt += `
+        以下是從這個講義/投影片檔案中「智慧讀取到的真實文字與大綱內容 (Document-to-Text)」：
+        ---
+        ${extractedOfficeText}
+        ---
+        
+        請依據上述的真實講義文字與大綱進行超高精華提煉，生成筆記、精確單字卡與隨堂測驗。
+        另外，使用者也有提供以下的附加指示、操作主題或要點說明：
+        ---
+        ${content}
+        ---
+        `;
+      } else if (nativeMultimodalPayload) {
+        userPrompt += `
+        後端已在此 API 請求中夾帶了您上傳的「實體 PDF 講義或講義頁面圖檔」。
+        請直接讀取與解析此 Multimodal 檔案之投影片頁面、文字、公式、圖表、示意圖，並進行高度精華提煉。
+        
+        另外，使用者有提供以下的附加指示、操作主題或重點備忘說明：
+        ---
+        ${content}
+        ---
+        `;
+      } else {
+        userPrompt += `
+        請依循以下使用者輸入內容，進行高精華深度分析與轉換：
+        ---
+        ${content}
+        ---
+        `;
+      }
+    } else {
+      userPrompt += `
       請依循以下使用者輸入內容，進行高精華深度分析與轉換：
       ---
       ${content}
       ---
-      
+      `;
+    }
+
+    userPrompt += `
       請務必同時生成：
-      1. 逐字稿/原文重建（約300-500字詳盡學術還原）
+      1. 逐字稿/原文重建（如果是 YouTube 影片且我們有抓取到上方的真實逐字稿，請重整、潤飾、補充學術格式後的此真實逐字稿，約 300-800 字的 Traditional Chinese 原文重建；如果是上傳的文檔講義，請根據文檔中的精準事實或我們預載的 multimodal 數據，輸出完美且結構清晰的講義對應對照大綱原文重建，約 300-800 字；否則請根據使用者內容生成詳盡書面還原）
       2. 一分鐘快速大綱（限3-5個點，字數不超過300字，白話好讀）
       3. 完整精華摘要（依章節或主題分類的詳細筆記，使用 Markdown 標題條列）
       4. 核心重點數位單字卡（3-6 張，包含專有名詞/公式 term 與白話解釋/生活舉例 explanation）
       5. 3 題高水準隨堂測驗（具備 question, 4個選項 options, 正確答案文字 A, B, C 或 D, 與詳盡考點分析 explanation）
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: userPrompt,
-      config: {
-        systemInstruction,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            transcript: {
-              type: Type.STRING,
-              description: 'A detailed Traditional Chinese reconstruction, expansion, or transcription of the lecture materials.'
-            },
-            summary_one_minute: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: '3-5 key bullet points summarizing the core concepts in under 300 words. Must be clear and easily readable.'
-            },
-            full_digest: {
-              type: Type.STRING,
-              description: 'Full rich detailed study notes structured beautifully by chapter, module, or theme in Markdown format.'
-            },
-            key_points_flashcards: {
-              type: Type.ARRAY,
-              description: 'An array of key terms/formulas and their simple traditional Chinese explanations and examples.',
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  term: { type: Type.STRING, description: 'The academic term, formula name, or core concept.' },
-                  explanation: { type: Type.STRING, description: 'Plain English/Chinese explanation with an easy-to-understand real-life analogy or scenario.' }
-                },
-                required: ['term', 'explanation']
-              }
-            },
-            quiz: {
-              type: Type.ARRAY,
-              description: 'Exactly 3 critical double-checked multiple-choice exam questions.',
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  question: { type: Type.STRING, description: 'The quiz question challenging student understanding.' },
-                  options: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: 'Exactly 4 choice options, e.g., ["A) ...", "B) ...", "C) ...", "D) ..."] or similar options.'
-                  },
-                  answer: {
-                    type: Type.STRING,
-                    description: 'The correct answer representing exactly "A", "B", "C", or "D".'
-                  },
-                  explanation: { type: Type.STRING, description: 'Detailed academic explanation for why this is the correct answer and why other elements are false.' }
-                },
-                required: ['question', 'options', 'answer', 'explanation']
-              }
-            }
-          },
-          required: ['transcript', 'summary_one_minute', 'full_digest', 'key_points_flashcards', 'quiz']
-        }
-      }
-    });
+    const contentsArray: any[] = [];
+    if (nativeMultimodalPayload) {
+      contentsArray.push(nativeMultimodalPayload);
+    }
+    contentsArray.push(userPrompt);
 
-    if (!response.text) {
+    const responseSchemaObj = {
+      type: Type.OBJECT,
+      properties: {
+        transcript: {
+          type: Type.STRING,
+          description: 'A detailed Traditional Chinese reconstruction, expansion, or transcription of the lecture materials.'
+        },
+        summary_one_minute: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description: '3-5 key bullet points summarizing the core concepts in under 300 words. Must be clear and easily readable.'
+        },
+        full_digest: {
+          type: Type.STRING,
+          description: 'Full rich detailed study notes structured beautifully by chapter, module, or theme in Markdown format.'
+        },
+        key_points_flashcards: {
+          type: Type.ARRAY,
+          description: 'An array of key terms/formulas and their simple traditional Chinese explanations and examples.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              term: { type: Type.STRING, description: 'The academic term, formula name, or core concept.' },
+              explanation: { type: Type.STRING, description: 'Plain English/Chinese explanation with an easy-to-understand real-life analogy or scenario.' }
+            },
+            required: ['term', 'explanation']
+          }
+        },
+        quiz: {
+          type: Type.ARRAY,
+          description: 'Exactly 3 critical double-checked multiple-choice exam questions.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              question: { type: Type.STRING, description: 'The quiz question challenging student understanding.' },
+              options: {
+                type: Type.ARRAY,
+                items: { type: Type.STRING },
+                description: 'Exactly 4 choice options, e.g., ["A) ...", "B) ...", "C) ...", "D) ..."] or similar options.'
+              },
+              answer: {
+                type: Type.STRING,
+                description: 'The correct answer representing exactly "A", "B", "C", or "D".'
+              },
+              explanation: { type: Type.STRING, description: 'Detailed academic explanation for why this is the correct answer and why other elements are false.' }
+            },
+            required: ['question', 'options', 'answer', 'explanation']
+          }
+        }
+      },
+      required: ['transcript', 'summary_one_minute', 'full_digest', 'key_points_flashcards', 'quiz']
+    };
+
+    let response;
+    let fallbackAttempt = false;
+    
+    // We ONLY enable search grounding tools for YouTube if we DID NOT retrieve a real transcript transcript!
+    // Search grounding tools consume 10x more RPM and quotas, and easily trigger 429 errors.
+    const enableSearchTools = sourceType === 'youtube' && !realYtTranscript;
+
+    try {
+      console.log(`[Gemini-Request] Invoking model with native tools enabled: ${enableSearchTools}`);
+      response = await executeGeminiWithRetry(ai, {
+        model: 'gemini-3.5-flash',
+        contents: contentsArray,
+        config: {
+          systemInstruction,
+          tools: enableSearchTools ? [{ googleSearch: {} }] : undefined,
+          responseMimeType: 'application/json',
+          responseSchema: responseSchemaObj
+        }
+      });
+    } catch (firstErr: any) {
+      console.warn('[Gemini-Request] First attempt failed or rate-limited:', firstErr.message || firstErr);
+      
+      // If we used search grounding, let's immediately retry WITHOUT search grounding to see if that resolves the quota restriction!
+      if (enableSearchTools) {
+        console.log('[Gemini-Request] Auto-retrying immediately WITHOUT Google Search tool to bypass rate-limits...');
+        fallbackAttempt = true;
+        
+        // Since Google Search failed, let's modify the user prompt slightly so AI knows to do the best it can with the textual metadata
+        const fallbackPrompt = userPrompt + '\n\n【注意】由於搜尋服務速率限制，請您直接以自身廣大內置知識與標題，盡力生成本主題的高水準精華摘要與隨堂考題。';
+        const fallbackContents = contentsArray.map(item => typeof item === 'string' ? fallbackPrompt : item);
+
+        try {
+          response = await executeGeminiWithRetry(ai, {
+            model: 'gemini-3.5-flash',
+            contents: fallbackContents,
+            config: {
+              systemInstruction,
+              tools: undefined, // ensure no tools
+              responseMimeType: 'application/json',
+              responseSchema: responseSchemaObj
+            }
+          });
+          console.log('[Gemini-Request] Fallback attempt succeeded perfectly!');
+        } catch (secondErr: any) {
+          throw secondErr; // throw if still fails
+        }
+      } else {
+        throw firstErr;
+      }
+    }
+
+    if (!response || !response.text) {
       return res.status(500).json({ error: 'AI generated an empty response.' });
     }
 
@@ -137,8 +410,16 @@ app.post('/api/generate', async (req, res) => {
 
   } catch (error: any) {
     console.error('Gemini processing error:', error);
+    
+    let userFriendlyMsg = error.message || 'Error occurred while processing request with Gemini API.';
+    if (userFriendlyMsg.includes('429') || userFriendlyMsg.includes('quota') || userFriendlyMsg.includes('RESOURCE_EXHAUSTED')) {
+      userFriendlyMsg = '【⚡ API 額度過載提示 (429)】目前的 Gemini 共享或個人 API 呼叫已達速率上限，或是 Google Search 搜尋工具額度已耗盡。您的輸入內容與已上傳之講義文檔完全有被安全保留，請稍候約 1 分鐘後再次點擊「開始生成」重試，通常即可順利通關！';
+    } else if (userFriendlyMsg.includes('API_KEY_INVALID') || userFriendlyMsg.includes('API key not valid')) {
+      userFriendlyMsg = '【❌ API Key 效期異常】請確認您內嵌的 API Key 是否有效。您也可以直接體驗上方 Preset 系統推薦的精選預製科系講義！';
+    }
+    
     res.status(500).json({ 
-      error: error.message || 'Error occurred while processing request with Gemini API.' 
+      error: userFriendlyMsg
     });
   }
 });
@@ -283,7 +564,7 @@ app.post('/api/cram/search', async (req, res) => {
       const targetSubject = subject || '重要學科';
       
       const ai = getGeminiClient();
-      const response = await ai.models.generateContent({
+      const response = await executeGeminiWithRetry(ai, {
         model: 'gemini-3.5-flash',
         contents: `你是一位學術考前精華提煉大師，口吻親切、直擊必考點。
         請專為「${targetGrade}」的「${targetSubject}」學門，精心提煉製作一份學術名詞、公式、以及常考思維「考前終極必看核心大綱與考法總整理懶人包」。
