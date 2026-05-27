@@ -1,5 +1,5 @@
 {
-  "name": "AI課堂筆記整理器",
+  "name": "課堂筆記整理器",
   "description": "專為學生打造的高效行動端課堂筆記整理與複習工具，支援錄音、圖片/投影片與YouTube連結，自動生成AI摘要及複習測驗。",
   "requestFramePermissions": [
     "microphone"

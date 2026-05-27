@@ -331,8 +331,18 @@ export default function App() {
   const visualInterval = useRef<NodeJS.Timeout | null>(null);
 
   // Sub-navigation state for interactive flashcard and one-minute study review
-  const [activeSubNotesTab, setActiveSubNotesTab] = useState<'digest' | 'flashcards'>('digest');
+  const [activeSubNotesTab, setActiveSubNotesTab] = useState<'digest' | 'flashcards' | 'notebook_chat'>('digest');
   const [flippedCards, setFlippedCards] = useState<Record<number, boolean>>({});
+
+  // Multi-source grounded interactive states
+  const [selectedSourceIds, setSelectedSourceIds] = useState<string[]>([]);
+  const [notebookChatQuery, setNotebookChatQuery] = useState('');
+  const [notebookChatHistory, setNotebookChatHistory] = useState<{ role: 'user' | 'assistant'; text: string }[]>([]);
+  const [isChatting, setIsChatting] = useState(false);
+  const [activeGuideType, setActiveGuideType] = useState<'faq' | 'study_guide' | 'timeline' | 'briefing' | null>(null);
+  const [generatedGuideContent, setGeneratedGuideContent] = useState<string | null>(null);
+  const [isGeneratingGuide, setIsGeneratingGuide] = useState(false);
+  const [highlightedSectionText, setHighlightedSectionText] = useState<string | null>(null);
 
   // Cram Hub Search & filter states
   const [cramGrade, setCramGrade] = useState<string>('');
@@ -444,6 +454,273 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
   const saveNotesToLocal = (newNotes: LectureNote[]) => {
     setNotesList(newNotes);
     localStorage.setItem('ai_lecture_notes', JSON.stringify(newNotes));
+  };
+
+  // Synchronize selected sources when activeNoteId changes or new notes arrive
+  useEffect(() => {
+    if (activeNoteId) {
+      setSelectedSourceIds(prev => {
+        if (!prev.includes(activeNoteId)) {
+          return [...prev, activeNoteId];
+        }
+        return prev;
+      });
+    }
+  }, [activeNoteId]);
+
+  // Selected Source Checklist Toggler
+  const handleToggleSource = (noteId: string) => {
+    setSelectedSourceIds(prev => {
+      if (prev.includes(noteId)) {
+        // Keep at least one source selected for a clean state
+        if (prev.length === 1) return prev;
+        return prev.filter(id => id !== noteId);
+      } else {
+        return [...prev, noteId];
+      }
+    });
+  };
+
+  // Parse PPT, PDF, TXT text slides or paragraphs into outline
+  const getOutlineSections = (note: LectureNote) => {
+    const sections: { title: string; textToFind: string; isHeading: boolean }[] = [];
+    const textToParse = note.full_digest || note.transcript || "";
+    const lines = textToParse.split('\n');
+    let headingCount = 0;
+    
+    // Check if there are Markdown headings
+    for (const line of lines) {
+      if (line.trim().startsWith('#')) {
+        const cleanTitle = line.replace(/^#+\s*/, '').trim();
+        sections.push({
+          title: cleanTitle,
+          textToFind: line.trim(),
+          isHeading: true
+        });
+        headingCount++;
+      }
+    }
+    
+    // If no markdown headings, create logical sections from paragraphs
+    if (headingCount === 0) {
+      const paragraphs = textToParse.split(/\n\s*\n/).filter(p => p.trim().length > 20);
+      paragraphs.forEach((para, idx) => {
+        if (idx < 5) { // Limit to top 5 logical outline chapters
+          const firstWords = para.trim().substring(0, 25) + '...';
+          sections.push({
+            title: `第 ${idx + 1} 章：${firstWords}`,
+            textToFind: para.trim(),
+            isHeading: false
+          });
+        }
+      });
+    }
+    
+    return sections;
+  };
+
+  // Helper to parse bold stars and file citations [1], [2] dynamically!
+  const parseInlineFormatting = (inputText: string) => {
+    if (!inputText) return '';
+    const parts: React.ReactNode[] = [];
+    let keyIdx = 0;
+
+    // A simple parser for bold and bracket citations [1], [2], [1][2], etc.
+    const regex = /(\*\*.*?\*\*|\[\d+\])/g;
+    let match;
+    let lastIndex = 0;
+
+    while ((match = regex.exec(inputText)) !== null) {
+      const matchText = match[0];
+      const matchIndex = match.index;
+
+      // Add text before match
+      if (matchIndex > lastIndex) {
+        parts.push(inputText.substring(lastIndex, matchIndex));
+      }
+
+      const cleanMatch = matchText.trim();
+      if (cleanMatch.startsWith('**') && cleanMatch.endsWith('**')) {
+        const innerSecret = cleanMatch.substring(2, cleanMatch.length - 2);
+        parts.push(<strong key={`b-${keyIdx++}`} className="font-bold text-[#111110]">{innerSecret}</strong>);
+      } else if (cleanMatch.startsWith('[') && cleanMatch.endsWith(']')) {
+        const num = cleanMatch.substring(1, cleanMatch.length - 1);
+        parts.push(
+          <button
+            key={`cite-${keyIdx++}`}
+            onClick={() => handleCitationClick(num)}
+            className="inline-flex items-center justify-center px-1.5 py-0.5 mx-0.5 text-[9px] font-extrabold text-amber-700 bg-amber-100 hover:bg-amber-200 active:scale-95 rounded border border-amber-300 font-mono transition-colors shadow-none cursor-pointer"
+            title={`點擊查看文件來源 [${num}] 詳細資訊`}
+          >
+            {num}
+          </button>
+        );
+      }
+
+      lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < inputText.length) {
+      parts.push(inputText.substring(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : inputText;
+  };
+
+  const handleCitationClick = (numStr: string) => {
+    const idx = parseInt(numStr, 10) - 1;
+    if (idx >= 0 && idx < selectedSourceIds.length) {
+      const matchedId = selectedSourceIds[idx];
+      const note = notesList.find(n => n.id === matchedId);
+      if (note) {
+        // Highlight citation origin
+        setErrorMessage(`📖 引用自來源 [${numStr}]：《${note.title}》`);
+        setTimeout(() => setErrorMessage(null), 5000);
+      }
+    }
+  };
+
+  const renderMarkdownText = (text: string) => {
+    if (!text) return null;
+    const lines = text.split('\n');
+    return (
+      <div className="space-y-3.5 text-xs text-[#37352F] leading-relaxed font-sans">
+        {lines.map((line, idx) => {
+          const trimmed = line.trim();
+          if (!trimmed) return <div key={idx} className="h-2" />;
+          
+          let content = line;
+          
+          // Headings
+          if (trimmed.startsWith('###')) {
+            content = trimmed.replace(/^###\s*/, '');
+            return <h4 key={idx} className="text-sm font-bold text-[#111110] mt-4 mb-2 flex items-center gap-1 border-b border-[#F1F1EF] pb-1 font-sans">{content}</h4>;
+          }
+          if (trimmed.startsWith('##')) {
+            content = trimmed.replace(/^##\s*/, '');
+            return <h3 key={idx} className="text-base font-bold text-[#111110] mt-5 mb-2 flex items-center gap-1.5 font-sans">{content}</h3>;
+          }
+          if (trimmed.startsWith('#')) {
+            content = trimmed.replace(/^#\s*/, '');
+            return <h2 key={idx} className="text-lg font-bold text-[#111110] mt-6 mb-3 flex items-center gap-2 font-sans">{content}</h2>;
+          }
+          
+          // Blockquotes
+          if (trimmed.startsWith('>')) {
+            content = trimmed.replace(/^>\s*/, '');
+            return (
+              <blockquote key={idx} className="border-l-4 border-amber-500 pl-3.5 py-1 my-3 bg-[#FAF9E0] rounded-r text-[#5A5A57] font-medium italic">
+                {parseInlineFormatting(content)}
+              </blockquote>
+            );
+          }
+          
+          // Lists
+          if (trimmed.startsWith('*') || trimmed.startsWith('-')) {
+            content = trimmed.replace(/^[\*\-]\s*/, '');
+            return (
+              <li key={idx} className="list-disc ml-4 pl-1 text-[#37352F]">
+                {parseInlineFormatting(content)}
+              </li>
+            );
+          }
+          
+          // Standard paragraphs
+          return (
+            <p key={idx} className="leading-relaxed text-[#37352F] font-medium whitespace-pre-line">
+              {parseInlineFormatting(content)}
+            </p>
+          );
+        })}
+      </div>
+    );
+  };
+
+  // Grounded Multi-Source Chat
+  const handleSendNotebookChat = async () => {
+    if (!notebookChatQuery.trim()) return;
+    if (selectedSourceIds.length === 0) {
+      setErrorMessage('請先選取至少一個文件筆記作為對話來源背景。');
+      return;
+    }
+
+    const userMessage = notebookChatQuery;
+    setNotebookChatQuery('');
+    setNotebookChatHistory(prev => [...prev, { role: 'user', text: userMessage }]);
+    setIsChatting(true);
+
+    try {
+      const sourceTexts = selectedSourceIds.map((id, index) => {
+        const note = notesList.find(n => n.id === id);
+        if (!note) return "";
+        return `【來源 [${index + 1}] 標題: ${note.title}】：\n${note.transcript}\n\n詳細章節及文摘概要:\n${note.full_digest || note.summary}`;
+      }).filter(text => text.length > 0);
+
+      const response = await fetch('/api/notebook/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sources: sourceTexts,
+          query: userMessage
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('AI 智慧對話解析失敗');
+      }
+
+      const data = await response.json();
+      setNotebookChatHistory(prev => [...prev, { role: 'assistant', text: data.answer }]);
+    } catch (e: any) {
+      console.error(e);
+      setNotebookChatHistory(prev => [...prev, { 
+        role: 'assistant', 
+        text: `⚠️ 系統提示：智慧對話發生錯誤（${e.message || '連線逾時'}）。請確認是否正確配置了 API Key，或切換下方 preset 樣板體驗不需設定的即時反應。` 
+      }]);
+    } finally {
+      setIsChatting(false);
+    }
+  };
+
+  // Study guide generators
+  const handleGenerateNotebookGuide = async (guideType: 'faq' | 'study_guide' | 'timeline' | 'briefing') => {
+    if (selectedSourceIds.length === 0) {
+      setErrorMessage('請先勾選至少一個講義投影片或筆記檔案作為生成來源。');
+      return;
+    }
+
+    setActiveGuideType(guideType);
+    setIsGeneratingGuide(true);
+    setGeneratedGuideContent(null);
+
+    try {
+      const sourceTexts = selectedSourceIds.map((id, index) => {
+        const note = notesList.find(n => n.id === id);
+        if (!note) return "";
+        return `【來源 [${index + 1}] 標題: ${note.title}】\n${note.transcript}\n\n詳細文摘概要:\n${note.full_digest || note.summary}`;
+      }).filter(text => text.length > 0);
+
+      const response = await fetch('/api/notebook/guide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sources: sourceTexts,
+          guideType
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('智慧文件導覽生成錯誤');
+      }
+
+      const data = await response.json();
+      setGeneratedGuideContent(data.content);
+    } catch (e: any) {
+      console.error(e);
+      setGeneratedGuideContent(`⚠️ 導覽生成失敗: ${e.message || '網路通訊阻礙，請確認 API Key 是否設定正確。'}`);
+    } finally {
+      setIsGeneratingGuide(false);
+    }
   };
 
   // Handle Preset Clicks
@@ -1060,26 +1337,47 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
             <div className="flex-1 overflow-y-auto pr-1 flex flex-col gap-1 max-h-[350px]">
               {notesList.map((note) => {
                 const isActive = note.id === activeNoteId;
+                const isSelected = selectedSourceIds.includes(note.id);
                 return (
-                  <button
+                  <div
                     key={note.id}
-                    onClick={() => {
-                      setActiveNoteId(note.id);
-                      setActiveTab('notes');
-                    }}
-                    className={`w-full text-left py-1.5 px-2 rounded-md transition-all truncate flex items-center gap-2 group cursor-pointer ${
+                    className={`w-full group flex items-center gap-2 py-1 px-1.5 rounded-md transition-all ${
                       isActive 
-                        ? 'bg-[#E3E2E0]/50 text-[#37352F] font-semibold' 
-                        : 'text-[#7C7B77] hover:bg-[#F1F1EF] hover:text-[#37352F]'
+                        ? 'bg-[#E3E2E0]/50 text-[#37352F]' 
+                        : 'text-[#585754] hover:bg-[#F1F1EF] hover:text-[#37352F]'
                     }`}
                   >
-                    <span className="shrink-0 text-xs text-slate-550">
-                      {note.sourceType === 'youtube' && '📺'}
-                      {note.sourceType === 'ppt' && '📄'}
-                      {note.sourceType === 'voice' && '🎙️'}
-                    </span>
-                    <span className="truncate flex-1 text-slate-800">{note.title}</span>
-                  </button>
+                    <input
+                      type="checkbox"
+                      checked={isSelected}
+                      onChange={() => handleToggleSource(note.id)}
+                      className="w-3.5 h-3.5 rounded accent-amber-600 cursor-pointer shrink-0 border border-[#C2C2BE]"
+                      title={isSelected ? "取消勾選此來源基底" : "將此檔案加為背景對話來源"}
+                    />
+                    <button
+                      onClick={() => {
+                        setActiveNoteId(note.id);
+                        setActiveTab('notes');
+                      }}
+                      className="flex-1 text-left min-w-0 transition-colors flex items-center gap-1.5 cursor-pointer text-xs"
+                    >
+                      <span className="shrink-0 text-xs">
+                        {note.sourceType === 'youtube' && '📺'}
+                        {note.sourceType === 'ppt' && '📄'}
+                        {note.sourceType === 'voice' && '🎙️'}
+                      </span>
+                      <span className={`truncate ${isActive ? 'font-bold' : 'font-medium'}`}>{note.title}</span>
+                    </button>
+                    
+                    {/* Tiny delete icon */}
+                    <button
+                      onClick={(e) => deleteNote(note.id, e)}
+                      className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 font-bold px-1 rounded transition-opacity cursor-pointer text-[10px]"
+                      title="刪除筆記"
+                    >
+                      ✕
+                    </button>
+                  </div>
                 );
               })}
               {notesList.length === 0 && (
@@ -1210,10 +1508,13 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
         {/* Title Block */}
         <div className="max-w-3xl w-full mx-auto px-6 md:px-12 pt-4 pb-2">
           <h1 className="text-3xl font-bold text-[#37352F] tracking-tight flex items-center gap-2">
-            AI 課堂筆記整理器
+            📚 課堂筆記整理器
           </h1>
-          <p className="text-[#7C7B77] text-sm mt-1.5 leading-relaxed">
-            這是一個高效學習工作空間。支援將語音講義、投影片大綱和 Youtube 課堂影片整合為高密度的學習摘要、考前重點提煉與自我評估測驗。
+          <p className="text-[#5A5A57] font-semibold text-xs mt-2 bg-amber-50 text-amber-900 px-3 py-2 rounded-md border border-amber-200 leading-relaxed">
+            🚀 <b>講義投影片與 YouTube 影片深度智慧解析！</b>
+            <span className="block mt-1 font-medium text-[11px] text-[#78350F]">
+              支援在此整合複數語音、PDF/PPT 講義檔案、及 YouTube 課堂線上影片，進行全自動大綱解析、高密度筆記精練、數位卡片，並可多來源交叉提問與產生一鍵 AI 自修導引地圖！
+            </span>
           </p>
         </div>
 
@@ -1350,16 +1651,16 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                   <div className="flex border-b border-[#E9E9E6] bg-[#F7F7F5]">
                     <button
                       onClick={() => setSourceType('voice')}
-                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-all ${
+                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
                         sourceType === 'voice' ? 'bg-white border-r border-[#E9E9E6] text-[#37352F] font-bold' : 'text-[#7C7B77] hover:bg-[#F1F1EF] border-r border-[#E9E9E6] last:border-r-0'
                       }`}
                     >
                       <Mic className="w-3.5 h-3.5" />
-                      語音錄製
+                      語音錄製筆記
                     </button>
                     <button
                       onClick={() => setSourceType('ppt')}
-                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-all ${
+                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
                         sourceType === 'ppt' ? 'bg-white border-x border-[#E9E9E6] first:border-l-0 last:border-r-0 text-[#37352F] font-bold' : 'text-[#7C7B77] hover:bg-[#F1F1EF] border-x border-[#E9E9E6] first:border-l-0 last:border-r-0'
                       }`}
                     >
@@ -1368,7 +1669,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                     </button>
                     <button
                       onClick={() => setSourceType('youtube')}
-                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer transition-all ${
+                      className={`flex-1 py-3 text-xs font-semibold flex items-center justify-center gap-1.5 cursor-pointer transition-all ${
                         sourceType === 'youtube' ? 'bg-white border-l border-[#E9E9E6] text-[#37352F] font-bold' : 'text-[#7C7B77] hover:bg-[#F1F1EF] border-l border-[#E9E9E6]'
                       }`}
                     >
@@ -1597,12 +1898,12 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                       {isProcessing ? (
                         <>
                           <RefreshCw className="w-4 h-4 animate-spin" />
-                          <span>AI 正在呼叫後端智慧編撰中 (3~5秒)...</span>
+                          <span>AI 智慧關聯大腦分析中 (3~5秒)...</span>
                         </>
                       ) : (
                         <>
                           <Sparkles className="w-4 h-4 text-amber-500" />
-                          <span>開始生成筆記與回顧複習題</span>
+                          <span>一鍵導入學習教材並分析</span>
                         </>
                       )}
                     </button>
@@ -1668,6 +1969,69 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                       </div>
                     </div>
 
+                    {/* Multi-source Track Panel and Action Guides */}
+                    <div className="bg-[#FAF9F5] border border-amber-200 p-4 rounded-lg text-xs text-[#37352F] flex flex-col xl:flex-row justify-between items-start xl:items-center gap-4">
+                      <div className="flex flex-col gap-1 min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="bg-amber-150 text-amber-900 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-300">
+                            多來源智慧關聯分析模式
+                          </span>
+                          <span className="text-[11px] font-bold text-[#37352F]">
+                            📚 目前已關聯架構：{selectedSourceIds.length} 個學習教材來源
+                          </span>
+                        </div>
+                        <p className="text-[10px] text-[#7C7B77] mt-0.5 leading-relaxed">
+                          您可以在左側「課程筆記庫」勾選/取消勾選複數講義簡報、YouTube影片或語音檔案。下方所有「智慧指引」與「對話框」將一併完美融合這些勾選材料進行交叉提問與宏觀研討！
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 mt-2">
+                          {selectedSourceIds.map((id, index) => {
+                            const note = notesList.find(n => n.id === id);
+                            if (!note) return null;
+                            return (
+                              <span key={id} className="inline-flex items-center gap-1 text-[10px] font-bold bg-white text-[#585754] border border-[#E9E9E6] px-2 py-0.5 rounded">
+                                <span className="text-amber-600 font-mono">[{index + 1}]</span>
+                                <span className="truncate max-w-[130px]">{note.title}</span>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      <div className="flex flex-col gap-1.5 w-full xl:w-auto shrink-0">
+                        <span className="text-[10px] font-bold text-[#7C7B77] uppercase tracking-wide">一鍵生成智慧指引地圖：</span>
+                        <div className="grid grid-cols-2 lg:flex gap-1.5">
+                          <button
+                            onClick={() => handleGenerateNotebookGuide('faq')}
+                            className="px-2.5 py-1.5 bg-white hover:bg-amber-50 text-amber-950 font-bold border border-[#E9E9E6] hover:border-amber-300 rounded text-[11px] transition-all flex items-center justify-center gap-1 cursor-pointer"
+                            title="生成常規高機率考題常見問答 (FAQ)"
+                          >
+                            💡 常問問答 FAQ
+                          </button>
+                          <button
+                            onClick={() => handleGenerateNotebookGuide('study_guide')}
+                            className="px-2.5 py-1.5 bg-white hover:bg-amber-50 text-amber-950 font-bold border border-[#E9E9E6] hover:border-amber-300 rounded text-[11px] transition-all flex items-center justify-center gap-1 cursor-pointer"
+                            title="規劃漸進自修學習攻略路線圖 Study Guide"
+                          >
+                            🗺️ 自修導引 Guide
+                          </button>
+                          <button
+                            onClick={() => handleGenerateNotebookGuide('timeline')}
+                            className="px-2.5 py-1.5 bg-white hover:bg-amber-50 text-amber-950 font-bold border border-[#E9E9E6] hover:border-amber-300 rounded text-[11px] transition-all flex items-center justify-center gap-1 cursor-pointer"
+                            title="梳理投影片概念邏輯演進時間軸 Timeline"
+                          >
+                            ⏳ 觀念時間軸 Timeline
+                          </button>
+                          <button
+                            onClick={() => handleGenerateNotebookGuide('briefing')}
+                            className="px-2.5 py-1.5 bg-white hover:bg-amber-50 text-amber-950 font-bold border border-[#E9E9E6] hover:border-amber-300 rounded text-[11px] transition-all flex items-center justify-center gap-1 cursor-pointer"
+                            title="產出專業簡潔的學術簡報手記 Briefing"
+                          >
+                            📑 亮點筆記手冊
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
                     {/* Sub tabs selector */}
                     <div className="flex gap-1 p-1 bg-[#F1F1EF] rounded-lg self-start text-xs select-none shadow-inner border border-[#E9E9E6]/60">
                       <button
@@ -1689,6 +2053,14 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                       >
                         🎴 數位記憶卡 ({activeNote.key_points_flashcards?.length || activeNote.keyPoints?.length || 0})
                       </button>
+                      <button
+                        onClick={() => setActiveSubNotesTab('notebook_chat')}
+                        className={`px-3 py-1.5 rounded-md font-bold transition-all cursor-pointer flex items-center gap-1 ${
+                          activeSubNotesTab === 'notebook_chat' ? 'bg-white text-[#37352F] shadow-xs animate-pulse-once' : 'text-[#7C7B77] hover:text-[#37352F]'
+                        }`}
+                      >
+                        💬 智慧多來源對話 ({selectedSourceIds.length} 個來源奠基)
+                      </button>
                     </div>
 
                     {/* Bento Layout Grid for Note Content */}
@@ -1697,7 +2069,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                       {/* Left Block (takes 2 cols on wide, 1 otherwise) */}
                       <div className="md:col-span-2 flex flex-col gap-5">
                         
-                        {activeSubNotesTab === 'digest' ? (
+                        {activeSubNotesTab === 'digest' && (
                           <>
                             {/* Summary Block */}
                             <div className="border border-[#E9E9E6] p-5 rounded-lg bg-white flex flex-col gap-3">
@@ -1719,14 +2091,16 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                             <div className="border border-[#E9E9E6] p-5 rounded-lg bg-white flex flex-col gap-3">
                               <h3 className="text-xs font-bold text-[#37352F] uppercase tracking-wider flex items-center gap-2 mb-1">
                                 <Lightbulb className="w-4 h-4 text-emerald-500" />
-                                完整精華章節筆記
+                                完整精華章節筆記 (AI 深度重構投影片精簡稿)
                               </h3>
                               <div className="text-xs text-[#5A5A57] leading-relaxed whitespace-pre-wrap font-medium prose prose-sm max-w-none">
                                 {activeNote.full_digest || activeNote.summary}
                               </div>
                             </div>
                           </>
-                        ) : (
+                        )}
+
+                        {activeSubNotesTab === 'flashcards' && (
                           /* Interactive Memory Flashcards View */
                           <div className="flex flex-col gap-4">
                             <div className="flex items-center justify-between">
@@ -1864,18 +2238,195 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                             </div>
                           </div>
                         )}
+
+                        {activeSubNotesTab === 'notebook_chat' && (
+                          /* Multi-source Grounded Conversation View */
+                          <div className="border border-[#E9E9E6] rounded-lg bg-white overflow-hidden flex flex-col h-[520px] shadow-xs">
+                            {/* Chat Header */}
+                            <div className="bg-[#FAF9F5] border-b border-[#E9E9E6] px-4 py-3 flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <Sparkles className="w-4 h-4 text-amber-500 shrink-0" />
+                                <div className="flex flex-col">
+                                  <span className="text-xs font-bold text-[#37352F]">Grounded Chat Room</span>
+                                  <span className="text-[10px] text-amber-800 font-semibold">
+                                    講答字句 100% 來自已關聯的 {selectedSourceIds.length} 份文件事實 [1] [2]...
+                                  </span>
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => setNotebookChatHistory([])}
+                                className="text-[10px] text-gray-500 hover:text-red-500 font-bold bg-white px-2 py-1 rounded border border-gray-200 cursor-pointer"
+                                title="清空聊天對話紀錄"
+                              >
+                                清空對話
+                              </button>
+                            </div>
+
+                            {/* Conversation Scroll Area */}
+                            <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/20">
+                              {notebookChatHistory.length === 0 ? (
+                                <div className="h-full flex flex-col items-center justify-center p-6 text-center text-[#5A5A57]">
+                                  <div className="text-3xl mb-3">💬</div>
+                                  <h4 className="text-xs font-bold text-[#37352F]">開啟講義文件之間的極致對話</h4>
+                                  <p className="text-[11px] text-[#7C7B77] max-w-[380px] mt-1 leading-relaxed">
+                                    您可以針對簡報內容進行深入提問。AI 將完全限制在講義事實中回答，並自動為關鍵句標記對應的 [來源編號]！
+                                  </p>
+                                  
+                                  {/* Quick queries list */}
+                                  <div className="mt-5 w-full max-w-[420px] flex flex-col gap-2 text-left">
+                                    <span className="text-[10px] font-bold text-[#7C7B77] uppercase tracking-wide">推薦提問：</span>
+                                    <button
+                                      onClick={() => {
+                                        setNotebookChatQuery("請用條列式，為我整理這幾份講義中最核心的 5 個核心精華考點。");
+                                      }}
+                                      className="p-2.5 text-[11px] font-semibold bg-white hover:bg-amber-50/50 text-[#37352F] border border-[#E9E9E6] hover:border-amber-300 rounded-lg text-left transition-all cursor-pointer"
+                                    >
+                                      📝 整理幾份講義中最精華的 5 個核心考點
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setNotebookChatQuery("有哪些重要學術概念或名詞定義在這些資料中被詳細討論？");
+                                      }}
+                                      className="p-2.5 text-[11px] font-semibold bg-white hover:bg-amber-50/50 text-[#37352F] border border-[#E9E9E6] hover:border-amber-300 rounded-lg text-left transition-all cursor-pointer"
+                                    >
+                                      🔍 列出在資料中被詳細定義的核心學術名詞
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        setNotebookChatQuery("請幫我出一題與本講義最相關的進階模擬問答思考題，並在下方提供解析與來源標註。");
+                                      }}
+                                      className="p-2.5 text-[11px] font-semibold bg-white hover:bg-amber-50/50 text-[#37352F] border border-[#E9E9E6] hover:border-amber-300 rounded-lg text-left transition-all cursor-pointer"
+                                    >
+                                      🧠 出一題相關的申論反思題，並隨附答案解析
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="space-y-4">
+                                  {notebookChatHistory.map((msg, i) => (
+                                    <div
+                                      key={i}
+                                      className={`flex flex-col ${
+                                        msg.role === 'user' ? 'items-end' : 'items-start'
+                                      }`}
+                                    >
+                                      <div
+                                        className={`max-w-[85%] rounded-xl px-4 py-3 text-xs leading-relaxed ${
+                                          msg.role === 'user'
+                                            ? 'bg-[#23221E] text-white font-semibold'
+                                            : 'bg-white border border-[#E9E9E6] text-[#37352F] shadow-2xs font-medium'
+                                        }`}
+                                      >
+                                        {msg.role === 'user' ? (
+                                          <p className="whitespace-pre-line">{msg.text}</p>
+                                        ) : (
+                                          renderMarkdownText(msg.text)
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                  {isChatting && (
+                                    <div className="flex items-center gap-2.5 text-xs text-amber-700 font-bold bg-amber-50 border border-amber-200 p-3 rounded-lg animate-pulse w-fit">
+                                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                      <span>AI 智慧關聯大腦正在交叉驗證文獻事實...</span>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Chat Input form */}
+                            <div className="bg-[#FAF9F5] border-t border-[#E9E9E6] p-3 flex gap-2">
+                              <input
+                                type="text"
+                                value={notebookChatQuery}
+                                onChange={(e) => setNotebookChatQuery(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter') {
+                                    handleSendNotebookChat();
+                                  }
+                                }}
+                                disabled={isChatting}
+                                placeholder="輸入對教材的任何問題，例如「解釋第二頁的公式機制」..."
+                                className="flex-1 px-3.5 py-2.5 text-xs bg-white border border-[#E9E9E6] rounded-lg outline-none focus:border-amber-600 transition-colors font-medium text-[#37352F]"
+                              />
+                              <button
+                                onClick={handleSendNotebookChat}
+                                disabled={isChatting}
+                                className="px-4 py-2 bg-[#23221E] hover:bg-[#37352F] text-white rounded-lg text-xs font-bold transition-all hover:scale-105 active:scale-95 disabled:opacity-50 cursor-pointer flex items-center justify-center gap-1.5"
+                              >
+                                <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                                詢問
+                              </button>
+                            </div>
+                          </div>
+                        )}
                         
                       </div>
 
-                      {/* Right: Original Transcript / Text Reconstruction */}
-                      <div className="border border-[#E9E9E6] p-5 rounded-lg bg-white flex flex-col gap-3 md:col-span-1">
-                        <h3 className="text-xs font-bold text-[#37352F] uppercase tracking-wider flex items-center gap-2 mb-1">
-                          <FileText className="w-4 h-4 text-[#7C7B77]" />
-                          課程重建逐字稿原文
-                        </h3>
-                        <div className="flex-1 max-h-[300px] md:max-h-[500px] overflow-y-auto text-[11px] leading-relaxed text-[#5A5A57] bg-[#F7F7F5] p-3 rounded font-mono whitespace-pre-wrap border border-[#E9E9E6]">
-                          {activeNote.transcript}
+                      {/* Right Block: PPT/PDF Slide Chapter Outline Jump Index and Original Rebuilt Transcript */}
+                      <div className="flex flex-col gap-5 md:col-span-1">
+                        
+                        {/* Outline Jump Menu Card */}
+                        <div className="border border-amber-200 p-4 rounded-lg bg-[#FAF9E0]/40 flex flex-col gap-3">
+                          <div className="flex items-center justify-between">
+                            <h3 className="text-[11px] font-bold text-amber-950 uppercase tracking-wide flex items-center gap-1.5 animate-fade-in">
+                              {activeNote.sourceType === 'youtube' ? '📺' : '📄'} {' '}
+                              {activeNote.sourceType === 'youtube' ? '影片結構/時間戳大綱' : '投影片幻燈片/章節大綱'} ({getOutlineSections(activeNote).length} 目錄)
+                            </h3>
+                            <span className="text-[9px] font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-250">
+                              快跳定位
+                            </span>
+                          </div>
+                          
+                          <div className="flex flex-col gap-1.5 max-h-[160px] overflow-y-auto pr-1">
+                            {getOutlineSections(activeNote).map((sec, sIdx) => (
+                              <button
+                                key={sIdx}
+                                onClick={() => {
+                                  setHighlightedSectionText(sec.title);
+                                  const textToSearch = sec.textToFind;
+                                  const transcriptEl = document.getElementById("notebook-transcript-viewer");
+                                  if (transcriptEl) {
+                                    const matchingTextNode = Array.from(transcriptEl.querySelectorAll('p, div, span, h2, h3, h4, li, strong'))
+                                      .find(el => el.textContent?.toLowerCase().includes(textToSearch.substring(0, 30).toLowerCase()));
+                                    if (matchingTextNode) {
+                                      matchingTextNode.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                      matchingTextNode.classList.add("bg-amber-100", "transition-all", "duration-1000");
+                                      setTimeout(() => {
+                                        matchingTextNode.classList.remove("bg-amber-100");
+                                      }, 3000);
+                                    }
+                                  }
+                                }}
+                                className="w-full text-left p-2 rounded-md hover:bg-white border border-transparent hover:border-[#E9E9E6] text-[11px] font-medium text-[#5F5E5A] hover:text-[#37352F] cursor-pointer transition-all flex items-center gap-1.5"
+                              >
+                                <span className="text-amber-600 font-mono text-[10px]">▶</span>
+                                <span className="truncate flex-1">{sec.title}</span>
+                              </button>
+                            ))}
+                            {getOutlineSections(activeNote).length === 0 && (
+                              <p className="text-[10px] text-gray-400 italic">正在從文件架構中解析大綱中...</p>
+                            )}
+                          </div>
                         </div>
+
+                        {/* Original Transcript Box */}
+                        <div className="border border-[#E9E9E6] p-5 rounded-lg bg-white flex flex-col gap-3 flex-1">
+                          <h3 className="text-xs font-bold text-[#37352F] uppercase tracking-wider flex items-center gap-2 mb-1">
+                            <FileText className="w-4 h-4 text-[#7C7B77]" />
+                            課程重建逐字稿原文
+                          </h3>
+                          <div 
+                            id="notebook-transcript-viewer"
+                            className="flex-1 max-h-[300px] md:max-h-[500px] overflow-y-auto text-[11px] leading-relaxed text-[#5A5A57] bg-[#F7F7F5] p-3 rounded font-mono whitespace-pre-wrap border border-[#E9E9E6] relative"
+                          >
+                            <p className="font-semibold text-[10.5px] leading-relaxed select-text">
+                              {activeNote.transcript}
+                            </p>
+                          </div>
+                        </div>
+
                       </div>
 
                     </div>
@@ -2582,27 +3133,39 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                     <div className="overflow-y-auto max-h-[180px] flex flex-col gap-1">
                       {notesList.map((note) => {
                         const isActive = note.id === activeNoteId;
+                        const isSelected = selectedSourceIds.includes(note.id);
                         return (
-                          <button
+                          <div
                             key={note.id}
-                            onClick={() => {
-                              setActiveNoteId(note.id);
-                              setActiveTab('notes');
-                              setIsMobileSidebarOpen(false);
-                            }}
-                            className={`w-full text-left py-1.5 px-2 rounded-md transition-all truncate flex items-center gap-2 group cursor-pointer ${
+                            className={`w-full flex items-center gap-2 py-1 px-1.5 rounded-md transition-all ${
                               isActive 
-                                ? 'bg-[#E3E2E0]/50 text-[#37352F] font-semibold' 
-                                : 'text-[#7C7B77] hover:bg-[#F1F1EF] hover:text-[#37352F]'
+                                ? 'bg-[#E3E2E0]/50 text-[#37352F]' 
+                                : 'text-[#585754] hover:bg-[#F1F1EF] hover:text-[#37352F]'
                             }`}
                           >
-                            <span className="shrink-0 text-xs text-slate-555">
-                              {note.sourceType === 'youtube' && '📺'}
-                              {note.sourceType === 'ppt' && '📄'}
-                              {note.sourceType === 'voice' && '🎙️'}
-                            </span>
-                            <span className="truncate flex-1 text-slate-800">{note.title}</span>
-                          </button>
+                            <input
+                              type="checkbox"
+                              checked={isSelected}
+                              onChange={() => handleToggleSource(note.id)}
+                              className="w-3.5 h-3.5 rounded accent-amber-600 cursor-pointer shrink-0 border border-[#C2C2BE]"
+                              title={isSelected ? "取消勾選此來源" : "將此檔案加為背景對話來源"}
+                            />
+                            <button
+                              onClick={() => {
+                                setActiveNoteId(note.id);
+                                setActiveTab('notes');
+                                setIsMobileSidebarOpen(false);
+                              }}
+                              className="flex-1 text-left min-w-0 transition-colors flex items-center gap-1.5 cursor-pointer text-xs"
+                            >
+                              <span className="shrink-0 text-xs">
+                                {note.sourceType === 'youtube' && '📺'}
+                                {note.sourceType === 'ppt' && '📄'}
+                                {note.sourceType === 'voice' && '🎙️'}
+                              </span>
+                              <span className={`truncate ${isActive ? 'font-bold' : 'font-medium'}`}>{note.title}</span>
+                            </button>
+                          </div>
                         );
                       })}
                       {notesList.length === 0 && (
@@ -2957,6 +3520,106 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                 >
                   確認關閉
                 </button>
+              </div>
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      {/* Interactive Study Guides Drawer Overlays */}
+      <AnimatePresence>
+        {activeGuideType && (
+          <>
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 0.45 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setActiveGuideType(null)}
+              className="fixed inset-0 bg-[#37352F]/40 backdrop-blur-xs z-50 flex items-center justify-center p-4"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95, y: 15 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 15 }}
+              className="fixed top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 bg-white border border-[#E9E9E6] w-full max-w-2xl rounded-xl shadow-2xl flex flex-col overflow-hidden max-h-[85vh] z-[60] text-[#37352F]"
+            >
+              {/* Modal Header */}
+              <div className="bg-[#FAF9F5] border-b border-[#E9E9E6] px-5 py-4 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-xl">
+                    {activeGuideType === 'faq' && '💡'}
+                    {activeGuideType === 'study_guide' && '🗺️'}
+                    {activeGuideType === 'timeline' && '⏳'}
+                    {activeGuideType === 'briefing' && '📑'}
+                  </span>
+                  <div className="flex flex-col text-left">
+                    <h3 className="text-xs md:text-sm font-extrabold text-[#37352F] tracking-tight">
+                      一鍵智慧講義導覽生成
+                    </h3>
+                    <p className="text-[10px] text-[#A16207] font-semibold text-left">
+                      {activeGuideType === 'faq' && '高頻學術考點問答合集 (FAQ)'}
+                      {activeGuideType === 'study_guide' && '自主進階研討導讀與反思地圖 (Study Guide)'}
+                      {activeGuideType === 'timeline' && '講義概念遞進與學術運行時間軸 (Timeline Chronology)'}
+                      {activeGuideType === 'briefing' && '關鍵字大綱亮點及摘要簡照亮點筆記手冊 (Briefing Doc)'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setActiveGuideType(null)}
+                  className="p-1 rounded bg-white hover:bg-gray-100 border border-gray-200 text-gray-400 hover:text-[#37352F] cursor-pointer transition-colors"
+                >
+                  ✕
+                </button>
+              </div>
+
+              {/* Modal Markdown Content Container */}
+              <div className="flex-1 overflow-y-auto p-6 bg-slate-50/25">
+                {isGeneratingGuide ? (
+                  <div className="flex flex-col items-center justify-center p-12 text-center gap-3">
+                    <RefreshCw className="w-8 h-8 text-amber-500 animate-spin" />
+                    <div className="text-xs font-bold text-[#37352F] animate-pulse">
+                      智囊正在交叉比對已勾選的 {selectedSourceIds.length} 份文件...
+                    </div>
+                    <p className="text-[11px] text-[#7C7B77] max-w-[340px] leading-relaxed mt-1">
+                      本程序將提取文件大綱與逐字稿，比對推演鏈並進行多維度融合寫作，請稍候 3~5 秒鐘...
+                    </p>
+                  </div>
+                ) : (
+                  <div className="prose prose-sm max-w-none text-[#37352F]">
+                    {generatedGuideContent ? (
+                      renderMarkdownText(generatedGuideContent)
+                    ) : (
+                      <p className="text-xs text-center text-gray-400 italic">無可用導覽內容。</p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Modal Footer */}
+              <div className="bg-[#FAF9F5] border-t border-[#E9E9E6] px-5 py-3 flex items-center justify-between gap-3">
+                <span className="text-[10px] text-[#A4A29E] font-medium font-mono">
+                  Grounded by Gemini 3.5 Flash
+                </span>
+                <div className="flex gap-2">
+                  {generatedGuideContent && !isGeneratingGuide && (
+                    <button
+                      onClick={() => {
+                        navigator.clipboard.writeText(generatedGuideContent || "");
+                        setErrorMessage("📋 導覽地圖內容已複製至您的剪貼簿！");
+                        setTimeout(() => setErrorMessage(null), 3500);
+                      }}
+                      className="px-3.5 py-1.5 bg-white hover:bg-amber-50 text-amber-970 font-semibold border border-[#E9E9E6] rounded text-xs transition-colors cursor-pointer active:scale-95 text-center"
+                    >
+                      複製指南 Markdown
+                    </button>
+                  )}
+                  <button
+                    onClick={() => setActiveGuideType(null)}
+                    className="px-3.5 py-1.5 bg-[#23221E] hover:bg-[#37352F] text-white font-bold rounded text-xs cursor-pointer active:scale-95 transition-all text-center"
+                  >
+                    關閉視窗
+                  </button>
+                </div>
               </div>
             </motion.div>
           </>
