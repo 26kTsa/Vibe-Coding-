@@ -343,15 +343,19 @@ app.post('/api/transcribe-audio', async (req, res) => {
     // Call high-fidelity transcription using Gemini 3.5 Flash with Retry
     const response = await executeGeminiWithRetry(ai, {
       model: 'gemini-3.5-flash',
-      contents: [
-        {
-          inlineData: {
-            data: audioBase64,
-            mimeType: cleanMimeType
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              data: audioBase64,
+              mimeType: cleanMimeType
+            }
+          },
+          {
+            text: '你是一個高精度的課堂錄音語音識別器。請將這段語音錄音精準、逐字翻譯/轉錄為繁體中文（台灣，zh-TW）。請只輸出最真實、逐字、不加任何修飾或額外標題的原文逐字稿內容，不要包含註解，不要任何引言、不用任何包裝文字。如果是安靜的沒有說話，請回傳「無語音內容」'
           }
-        },
-        '你是一個高精度的課堂錄音語音識別器。請將這段語音錄音精準、逐字翻譯/轉錄為繁體中文（台灣，zh-TW）。請只輸出最真實、逐字、不加任何修飾或額外標題的原文逐字稿內容，不要包含註解，不要任何引言、不用任何包裝文字。如果是安靜的沒有說話，請回傳「無語音內容」'
-      ]
+        ]
+      }
     });
 
     const transcript = response.text?.trim() || '無法辨識語音內容。';
@@ -540,11 +544,13 @@ app.post('/api/generate', async (req, res) => {
       5. 3 題高水準隨堂測驗（具備 question, 4個選項 options, 正確答案文字 A, B, C 或 D, 與詳盡考點分析 explanation）
     `;
 
-    const contentsArray: any[] = [];
+    const partsArray: any[] = [];
     if (nativeMultimodalPayload) {
-      contentsArray.push(nativeMultimodalPayload);
+      partsArray.push(nativeMultimodalPayload);
     }
-    contentsArray.push(userPrompt);
+    partsArray.push({ text: userPrompt });
+
+    const contentsObj = { parts: partsArray };
 
     const responseSchemaObj = {
       type: Type.OBJECT,
@@ -610,7 +616,7 @@ app.post('/api/generate', async (req, res) => {
       console.log(`[Gemini-Request] Invoking model with native tools enabled: ${enableSearchTools}`);
       response = await executeGeminiWithRetry(ai, {
         model: 'gemini-3.5-flash',
-        contents: contentsArray,
+        contents: contentsObj,
         config: {
           systemInstruction,
           tools: enableSearchTools ? [{ googleSearch: {} }] : undefined,
@@ -628,12 +634,18 @@ app.post('/api/generate', async (req, res) => {
         
         // Since Google Search failed, let's modify the user prompt slightly so AI knows to do the best it can with the textual metadata
         const fallbackPrompt = userPrompt + '\n\n【注意】由於搜尋服務速率限制，請您直接以自身廣大內置知識與標題，盡力生成本主題的高水準精華摘要與隨堂考題。';
-        const fallbackContents = contentsArray.map(item => typeof item === 'string' ? fallbackPrompt : item);
+        const fallbackParts = partsArray.map(part => {
+          if ('text' in part) {
+            return { text: fallbackPrompt };
+          }
+          return part;
+        });
+        const fallbackContentsObj = { parts: fallbackParts };
 
         try {
           response = await executeGeminiWithRetry(ai, {
             model: 'gemini-3.5-flash',
-            contents: fallbackContents,
+            contents: fallbackContentsObj,
             config: {
               systemInstruction,
               tools: undefined, // ensure no tools
