@@ -20,6 +20,41 @@ import { INITIAL_CRAM_DB, CramItem } from './data/cramDb';
 export default function App() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('input');
   
+  // Safe Response JSON parser helper to catch Vercel free-tier limits or 404 HTML responses
+  const parseResponseJson = async (response: Response, defaultErrorText = '後端處理失敗') => {
+    let text = '';
+    try {
+      text = await response.text();
+    } catch (readErr) {
+      throw new Error('無法讀取伺服器回應，請檢查網路連線。');
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (!response.ok) {
+        throw new Error(parsed.error || defaultErrorText);
+      }
+      return parsed;
+    } catch (parseErr: any) {
+      // If it is already our custom error from inside the try, re-throw it directly
+      if (parseErr.message && !parseErr.message.includes('Unexpected token') && !parseErr.message.includes('JSON')) {
+        throw parseErr;
+      }
+      
+      console.error('JSON Parse error:', text);
+      const lowerText = text.toLowerCase();
+      if (lowerText.includes('payload_too_large') || lowerText.includes('too large') || response.status === 413) {
+        throw new Error('【⚠️ 講義檔案過大限制】您上傳的投影片/PDF 檔案或錄音體積過大。當前 Vercel 託管平台具有硬性的 4.5MB 傳輸大小上限。請嘗試改用較小的 PDF/PPT 檔案，或是在本系統的 AI Studio 預覽頁面中開發執行，即可輕易解除檔案大小限制！');
+      } else if (lowerText.includes('page could not be found') || lowerText.includes('404') || lowerText.includes('not found')) {
+        throw new Error('【⚠️ 伺服器未啟用或不支援 API 後端】您目前使用的 Vercel 託管部署，可能未正常啟用完整的 Node.js Express 伺服器服务（多數預設只部署靜態 SPA 前端網頁）。請回到 AI Studio 主預覽視窗中使用完整功能，或直接使用預置的 Preset 課堂講義體驗！');
+      } else if (response.status >= 500) {
+        throw new Error('【⚠️ 伺服器內部錯誤 (500)】伺服器處理該請求時遭遇了未知異常。可能是上傳的 PDF/PPT 文件包含損壞或未支援的加密格式。建議您將內容文字貼入下方的說明欄中重新送出！');
+      } else {
+        throw new Error(`【⚠️ 伺服器解析異常】無法讀取後端回應（可能因檔案過大導致連線中斷或回傳 HTML，狀態碼: ${response.status}）。建議上傳較輕量之投影片檔案後重試。`);
+      }
+    }
+  };
+
   // Input fields
   const [sourceType, setSourceType] = useState<'voice' | 'ppt' | 'youtube'>('voice');
   const [lectureTitle, setLectureTitle] = useState('');
@@ -665,11 +700,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
         })
       });
 
-      if (!response.ok) {
-        throw new Error('AI 智慧對話解析失敗');
-      }
-
-      const data = await response.json();
+      const data = await parseResponseJson(response, 'AI 智慧對話解析失敗');
       setNotebookChatHistory(prev => [...prev, { role: 'assistant', text: data.answer }]);
     } catch (e: any) {
       console.error(e);
@@ -709,11 +740,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
         })
       });
 
-      if (!response.ok) {
-        throw new Error('智慧文件導覽生成錯誤');
-      }
-
-      const data = await response.json();
+      const data = await parseResponseJson(response, '智慧文件導覽生成錯誤');
       setGeneratedGuideContent(data.content);
     } catch (e: any) {
       console.error(e);
@@ -800,12 +827,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
               })
             });
 
-            if (!response.ok) {
-              const errData = await response.json();
-              throw new Error(errData.error || '語音轉文字請求失敗。');
-            }
-
-            const data = await response.json();
+            const data = await parseResponseJson(response, '語音轉文字請求失敗。');
             if (data.transcript) {
               setCustomContent(data.transcript);
             }
@@ -1005,12 +1027,7 @@ JavaScript 是一門**單執行緒**的程式語言。這表示它在同一時�
         }),
       });
 
-      if (!response.ok) {
-        const errData = await response.json();
-        throw new Error(errData.error || '後端生成筆記失敗');
-      }
-
-      const generatedData = await response.json();
+      const generatedData = await parseResponseJson(response, '後端生成筆記失敗');
 
       const rawQuiz = generatedData.quiz || [];
       const normalizedQuiz = rawQuiz.map((q: any) => {
