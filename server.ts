@@ -1122,11 +1122,15 @@ async function initServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on port ${PORT}`);
-  });
+  if (!process.env.VERCEL) {
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`Server running on port ${PORT}`);
+    });
+  }
 }
 
 initServer().catch(err => {
   console.error('Server failed to start:', err);
 });
+
+export default app;
