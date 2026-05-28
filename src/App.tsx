@@ -1431,7 +1431,6 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
               <span className="text-[9.5px] text-[#A4A29E] truncate select-text">{currentUser.email}</span>
             </div>
           )}
-          <p className="px-1 select-none font-mono text-[9.5px] text-[#A4A29E]">UTC: 2026-05-21</p>
         </div>
       </aside>
 
@@ -3213,7 +3212,6 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
                     <p className="text-[10px] text-[#A4A29E] truncate">{currentUser.email}</p>
                   </div>
                 )}
-                <p className="px-1 select-none font-mono text-[9px] text-[#A4A29E]">UTC: 2026-05-21</p>
               </div>
             </motion.aside>
           </>
