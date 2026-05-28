@@ -1252,7 +1252,7 @@ ${activeNote.keyPoints.map((kp, idx) => `${idx + 1}. ${kp}`).join('\n')}
               type="submit"
               className="w-full bg-[#23221E] hover:bg-[#37352F] text-white text-xs font-bold py-3 rounded cursor-pointer transition-all active:scale-98 mt-2 shadow-xs text-center animate-none"
             >
-              {authMode === 'login' ? '立即登入安全工作區' : '註冊並自動登入'}
+              {authMode === 'login' ? '立即登入工作區' : '註冊並自動登入'}
             </button>
           </form>
 
