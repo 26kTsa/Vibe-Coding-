@@ -407,8 +407,8 @@ app.post('/api/generate', async (req, res) => {
         const fileBuffer = Buffer.from(fileBase64, 'base64');
         const lowerMime = fileMimeType.toLowerCase();
         
-        // Native supported multimodal types by Gemini 3.5 Flash:
-        const isNativeMultimodal = lowerMime === 'application/pdf' || lowerMime.startsWith('image/');
+        // Images are lightweight and best processed natively as multimodal content by Gemini 3.5 Flash
+        const isNativeMultimodal = lowerMime.startsWith('image/');
 
         if (isNativeMultimodal) {
           console.log(`[Gemini-Multimodal] Mounting native Gemini media asset. Mime: ${lowerMime}`);
@@ -429,27 +429,41 @@ app.post('/api/generate', async (req, res) => {
             console.log(`[File-Parser] Reading plain text file content directly.`);
             extractedOfficeText = fileBuffer.toString('utf-8');
           } else {
-            // Treat it as an Office Document (.pptx, .docx, .xlsx, .odt, etc.)
-            console.log(`[File-Parser] Attempting to parse Office document (${lowerMime}) via officeparser.`);
+            // Treat it as an Office Document or PDF (.pptx, .docx, .xlsx, .pdf, .odt, etc.)
+            console.log(`[File-Parser] Attempting to parse document (${lowerMime}) via officeparser.`);
             
-            const parsed = await new Promise<any>((resolve, reject) => {
-              officeParser.parseOffice(fileBuffer, (data, err) => {
-                if (err) {
-                  reject(err);
-                } else {
-                  resolve(data);
+            try {
+              const ast = await officeParser.parseOffice(fileBuffer);
+              if (ast) {
+                if (typeof ast === 'string') {
+                  extractedOfficeText = ast;
+                } else if (typeof ast === 'object' && typeof ast.toText === 'function') {
+                  extractedOfficeText = ast.toText();
+                } else if (typeof ast === 'object' && (ast as any).text) {
+                  extractedOfficeText = (ast as any).text;
                 }
-              });
-            });
-
-            if (parsed && typeof parsed === 'string') {
-              extractedOfficeText = parsed.trim();
-              console.log(`[File-Parser] Successfully extracted ${extractedOfficeText.length} characters from Office document.`);
+                
+                extractedOfficeText = (extractedOfficeText || '').trim();
+                console.log(`[File-Parser] Successfully extracted ${extractedOfficeText.length} characters from document.`);
+              }
+            } catch (parseErr: any) {
+              console.error(`[File-Parser] officeparser failed to parse document with MIME ${fileMimeType}:`, parseErr.message || parseErr);
+              
+              // Safe fallback: if this is a PDF, dynamically fall back to native multimodal media asset mounting
+              if (lowerMime === 'application/pdf') {
+                console.log(`[File-Parser] Falling back to Gemini's native multimodal payload for PDF processing.`);
+                nativeMultimodalPayload = {
+                  inlineData: {
+                    data: fileBase64,
+                    mimeType: lowerMime
+                  }
+                };
+              }
             }
           }
         }
       } catch (err: any) {
-        console.error(`[File-Parser] Error parsing file with MIME ${fileMimeType}:`, err.message || err);
+        console.error(`[File-Parser] Critical processing error for file with MIME ${fileMimeType}:`, err.message || err);
         // Do not crash - back up to the user-entered text content
       }
     }
